@@ -115,12 +115,12 @@
 
 *Prices from [models.dev](https://models.dev), loaded from `/home/jon/.agentty/cache/modelsdev.json`; all amounts are United States Dollars (USD). Cost = prompt/1M × input-rate + completion/1M × output-rate.*
 
-| Model | Provider | $/1M in | $/1M out | Turns | Input cost | Output cost | Total cost |
-|---|---|---|---|---|---|---|---|
-| kimi-k3 | crof | 2 | 8 | 85 | $5.8001 | $0.2628 | $6.0629 |
-| glm-5.3 | https://ollama.com/v1#main | 0.4 | 1.4 | 129 | $2.4916 | $0.0904 | $2.5821 |
-| glm-5.3-flash | vancine | 0.06 | 0.2 | 182 | $0.6751 | $0.0593 | $0.7344 |
-| **Total** | | | | | $8.9668 | $0.4125 | **$9.3793** |
+| Model | $/1M in | Input cost | $/1M out | Output cost | Turns | Total cost |
+|---|---|---|---|---|---|---|
+| kimi-k3 | $2.0000 | $5.8001 | $8.0000 | $0.2628 | 85 | $6.0629 |
+| glm-5.3 | $0.4000 | $2.4916 | $1.4000 | $0.0904 | 129 | $2.5821 |
+| glm-5.3-flash | $0.0600 | $0.6751 | $0.2000 | $0.0593 | 182 | $0.7344 |
+| **Total** | | $8.9668 | | $0.4125 | | **$9.3793** |
 
 *Note: estimates use input/output token counts from the logs; cache-read/cache-write tokens are not logged and are therefore not reflected in these figures.*
 

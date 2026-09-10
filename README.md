@@ -44,9 +44,9 @@ non-zero. A malformed or empty pricing file is treated the same way. To
 produce a report without the cost section entirely, pass `--no-cost`.
 
 Estimates are computed as `prompt_tokens/1e6 × $/1M-in +
-completion_tokens/1e6 × $/1M-out` per turn, using each turn's provider when
-several providers list the same model (resellers/subscription plans may
-price it differently). Cache-read/cache-write tokens are not logged by
+completion_tokens/1e6 × $/1M-out` per turn. Pricing is provider-agnostic:
+when several providers list the same model key, the cheapest metered
+(non-zero) rate wins. Cache-read/cache-write tokens are not logged by
 agentty and are therefore not part of the estimate; date-stamped model ids
 (e.g. `gpt-5.1-2025-11-13`) are matched to the base model and marked
 "(approx.)" in the report.

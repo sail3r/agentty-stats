@@ -619,31 +619,24 @@ static bool load_pricing(const string& path, Pricing& pr, bool& missing_default_
 struct Rate {          // resolved USD-per-1M-token rates
     double in = 0, out = 0;
     bool exact = true; // false when matched by fuzzy date-prefix
-    string provider;   // models.dev provider whose rates were picked
 };
 
 // Exact-key resolution for one candidate key against the pricing table.
-// When several providers list the same model key (resellers), prefer the
-// turn's provider (exact models.dev id); otherwise fall back
-// deterministically to the cheapest metered (non-zero) input rate.
-static bool rate_for_key(const Pricing& pr, const string& key, const string& provider, Rate& r) {
+// models.dev is the sole source of truth and is provider-agnostic: when
+// several providers list the same model key (resellers), the cheapest
+// metered (non-zero) input rate wins; a sole zero-cost entry prices at $0.
+static bool rate_for_key(const Pricing& pr, const string& key, Rate& r) {
     auto it = pr.by_key.find(key);
     if (it == pr.by_key.end()) return false;
     const vector<std::pair<string, ModelCost>>& cands = it->second;
     const std::pair<string, ModelCost>* pick = &cands[0];
-    bool provider_hit = false;
+    const std::pair<string, ModelCost>* best = nullptr;
     for (const auto& cand : cands)
-        if (!provider.empty() && cand.first == provider) { pick = &cand; provider_hit = true; break; }
-    if (!provider_hit && cands.size() > 1) {
-        const std::pair<string, ModelCost>* best = nullptr;
-        for (const auto& cand : cands)
-            if (cand.second.in > 0 || cand.second.out > 0)
-                if (!best || cand.second.in < best->second.in) best = &cand;
-        if (best) pick = best;
-    }
+        if (cand.second.in > 0 || cand.second.out > 0)
+            if (!best || cand.second.in < best->second.in) best = &cand;
+    if (best) pick = best;
     r.in = pick->second.in;
     r.out = pick->second.out;
-    r.provider = pick->first;
     r.exact = true;
     return true;
 }
@@ -651,15 +644,15 @@ static bool rate_for_key(const Pricing& pr, const string& key, const string& pro
 // Resolve a log model name to rates. Order: exact key, then the listed key
 // whose trailing date stamp is stripped ("gpt-5.1-2025-11-13" -> "gpt-5.1",
 // "glm-5.2-20251113" -> "glm-5.2"), else not priced.
-static bool resolve_cost(const Pricing& pr, const string& model, const string& provider, Rate& r) {
+static bool resolve_cost(const Pricing& pr, const string& model, Rate& r) {
     if (model.empty() || !pr.loaded) return false;
-    if (rate_for_key(pr, model, provider, r)) return true;
+    if (rate_for_key(pr, model, r)) return true;
     static const std::regex DATE_STAMP_RE("-(\\d{4}-\\d{2}-\\d{2}|\\d{8,14})$");
     std::smatch dm;
     if (std::regex_search(model, dm, DATE_STAMP_RE)) {
         string base = model.substr(0, model.size() - dm[0].length());
         Rate fr;
-        if (!base.empty() && rate_for_key(pr, base, provider, fr)) {
+        if (!base.empty() && rate_for_key(pr, base, fr)) {
             r = fr;
             r.exact = false;   // matched via date-suffix normalisation
             return true;
@@ -693,7 +686,6 @@ struct CostAcc {
     double rate_in = 0, rate_out = 0;   // USD per 1M tokens
     double input_usd = 0, output_usd = 0, total_usd = 0;
     bool exact_rate = true;
-    string provider;
 };
 
 // Sort a string->count map into a vector ordered by count descending (then
@@ -794,22 +786,16 @@ int main(int argc, char** argv) {
     }
     map<string, CostAcc> cost_acc;
     if (pricing_enabled) {
-        // Prefer each turn's provider when the same model key exists under
-        // several providers (resellers); keep per-provider rates in the row.
+        // models.dev pricing is provider-agnostic; resolve once per model.
         for (Turn& t : s.turn_list) {
             if (t.model.empty()) continue;
             Rate r;
-            if (!resolve_cost(pricing, t.model, t.provider, r)) continue;
+            if (!resolve_cost(pricing, t.model, r)) continue;
             CostAcc& a = cost_acc[t.model];
             if (a.turns == 0) {
                 a.rate_in = r.in;
                 a.rate_out = r.out;
                 a.exact_rate = r.exact;
-                // Show the provider actually used by the turns from the log
-                // (same values as the "## Providers" table). Fall back to the
-                // models.dev provider whose rates were picked only when the
-                // log turns carry no provider.
-                a.provider = t.provider.empty() ? r.provider : t.provider;
             } else if (r.exact && (r.in != a.rate_in || r.out != a.rate_out)) {
                 a.exact_rate = false;  // mixed rates across turns/providers
             }
@@ -966,8 +952,8 @@ int main(int argc, char** argv) {
     } else if (cost_acc.empty()) {
         o << "*No priced models: none of the models in the logs could be matched to a models.dev entry.*\n\n";
     } else {
-        o << "| Model | Provider | $/1M in | $/1M out | Turns | Input cost | Output cost | Total cost |\n";
-        o << "|---|---|---|---|---|---|---|---|\n";
+        o << "| Model | $/1M in | Input cost | $/1M out | Output cost | Turns | Total cost |\n";
+        o << "|---|---|---|---|---|---|---|\n";
         vector<const std::pair<const string, CostAcc>*> cost_rows;
         for (const auto& kv : cost_acc) cost_rows.push_back(&kv);
         std::stable_sort(cost_rows.begin(), cost_rows.end(),
@@ -985,17 +971,16 @@ int main(int argc, char** argv) {
             grand_out += a.output_usd;
             grand_total += a.total_usd;
             o << "| " << name
-              << " | " << (a.provider.empty() ? "-" : a.provider)
-              << " | " << a.rate_in
-              << " | " << a.rate_out
-              << " | " << a.turns
+              << " | " << usd_fmt(a.rate_in)
               << " | " << usd_fmt(a.input_usd)
+              << " | " << usd_fmt(a.rate_out)
               << " | " << usd_fmt(a.output_usd)
+              << " | " << a.turns
               << " | " << usd_fmt(a.total_usd)
               << (a.exact_rate ? "" : " (approx.)")
               << " |\n";
         }
-        o << "| **Total** | | | | | " << usd_fmt(grand_in) << " | " << usd_fmt(grand_out) << " | **" << usd_fmt(grand_total) << "** |\n\n";
+        o << "| **Total** | | " << usd_fmt(grand_in) << " | | " << usd_fmt(grand_out) << " | | **" << usd_fmt(grand_total) << "** |\n\n";
         long long unpriced_turns = 0;
         for (auto& kv : s.models) {
             if (cost_acc.count(kv.first)) continue;
@@ -1102,7 +1087,7 @@ int main(int argc, char** argv) {
             string turn_cost = "-";
             if (pricing_enabled && !t->model.empty()) {
                 Rate r;
-                if (resolve_cost(pricing, t->model, t->provider, r))
+                if (resolve_cost(pricing, t->model, r))
                     turn_cost = usd_fmt((double)t->prompt_tokens / 1e6 * r.in + (double)t->completion_tokens / 1e6 * r.out);
             }
             o << "| " << i++
