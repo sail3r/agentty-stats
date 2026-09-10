@@ -273,7 +273,10 @@ static void process_event(Stats& s) {
         if (s.cur_turn) {
             s.cur_turn->chunk_bytes += b;
             s.cur_turn->chunks++;
-            // usage tokens live in the raw JSON payload
+            // Ollama streams usage on EVERY chunk as a rolling cumulative
+            // snapshot (not a delta). Each snapshot grows monotonically, so
+            // later overwrites are correct — the final value lands on the
+            // last chunk before stream.end. Never early-out on has_usage.
             std::smatch pm;
             if (std::regex_search(pl, pm, std::regex("\"prompt_tokens\":(\\d+)"))) {
                 s.cur_turn->prompt_tokens = atoll(pm[1].str().c_str());
