@@ -8,16 +8,48 @@ See `Example_Report.md` for a full sample of the generated output.
 ## Syntax
 
 ```sh
-agentty-stats <log-files>... <output-file>
+agentty-stats <log-files>... <output-file> [--cost /path/to/modelsdev.json] [--no-cost]
 
 ./agentty-stats a.log report.md
 ./agentty-stats a.log b.log combined-report.md
 ./agentty-stats ./* all_logs_report.md
+./agentty-stats a.log report.md --cost "$AGENTTY_HOME/cache/modelsdev.json"
+./agentty-stats a.log report.md --no-cost
 ```
 
 The last argument is the output `.md` file; every preceding argument is an
 input log file. All inputs are aggregated into a single report (turns are
 ordered by wall-clock time across files).
+
+## Cost reporting (USD)
+
+By default agentty-stats estimates the USD cost of every model in the logs
+using the [models.dev](https://models.dev) pricing data (all prices are USD
+per 1M tokens) that agentty fetches and refreshes every 24 hours, normally
+stored at `$AGENTTY_HOME/cache/modelsdev.json` (default
+`~/.agentty/cache/modelsdev.json`).
+
+Because AGENTTY_HOME may be set to a non-default location on some systems,
+the pricing file can be pointed to manually:
+
+```sh
+agentty-stats a.log report.md --cost /path/to/modelsdev.json
+# or, equivalently:
+export AGENTTY_MODELS_DEV=/path/to/modelsdev.json
+```
+
+If the file cannot be found at the default location, the tool prints an error
+explaining how to pass `--cost` (or set `AGENTTY_MODELS_DEV`) and exits
+non-zero. A malformed or empty pricing file is treated the same way. To
+produce a report without the cost section entirely, pass `--no-cost`.
+
+Estimates are computed as `prompt_tokens/1e6 × $/1M-in +
+completion_tokens/1e6 × $/1M-out` per turn, using each turn's provider when
+several providers list the same model (resellers/subscription plans may
+price it differently). Cache-read/cache-write tokens are not logged by
+agentty and are therefore not part of the estimate; date-stamped model ids
+(e.g. `gpt-5.1-2025-11-13`) are matched to the base model and marked
+"(approx.)" in the report.
 
 ## Setup
 
@@ -97,10 +129,14 @@ tool extracts for per-turn and per-model token accounting.
 1. **Overview** — turns, time span, models, total tokens, wire volume, tool calls, persistence, models loaded (per file), errors.
 2. **Log volume** — counts by level, component, and event.
 3. **Smart-mode routing** — role, complexity, orchestration flags.
-4. **Per-model usage** — turns, prompt/completion tokens, request/chunk bytes, chunk counts, retried turns, errors.
-5. **Tool usage** — calls, total/avg/max latency, ok/err.
+4. **Per-model usage** — turns, prompt/completion tokens, request/chunk bytes, chunk counts, retried turns, errors (sorted by turns, descending).
+4b. **Cost (USD)** — per-model input/output cost, $/1M rates from models.dev, grand total; per-turn cost column in §7. Sorted by total cost, descending. Rates are only ever taken from a truthful source: a token price exposed by the provider's own API (none currently do) or models.dev otherwise — the per-row **Source** column states which one, and how endpoint URLs in the log (e.g. `https://ollama.com/v1#main`) resolved to a models.dev provider. A model listed by its provider with no published price is shown as `(plan)` at $0.00. Pass `--no-cost` to skip.
+5. **Tool usage** — calls, total/avg/max latency, ok/err (sorted by calls, descending).
 6. **Wire / streaming** — stop reasons, HTTP status, hosts, providers.
 6b. **Failures & retries** — retried turns, HTTP-error turns (by status), `stream.retry` attempts, `stream.error` classes, connection failures, samples.
 7. **Turn-by-turn detail** — per-turn model, complexity, stop reason, retry count, tokens, chunks, bytes, duration.
 8. **Error-level events** — counts and samples (routine `openai.auth` lines are excluded).
 9. **Persistence** — thread saves and message counts.
+
+All two-column count tables (log volume, routing, wire/streaming, failures,
+errors) are sorted by count, descending.

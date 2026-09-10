@@ -27,6 +27,8 @@
 #include <ctime>
 #include <iomanip>
 #include <sstream>
+#include <memory>
+#include <cctype>
 
 using std::string;
 using std::vector;
@@ -182,6 +184,7 @@ struct Stats {
 
     // Pending router decision (route.turn precedes dispatch.turn)
     string pend_role, pend_complexity, pend_model, pend_effort;
+    string pend_provider;   // last provider.select (persists across turns)
     int pend_orch = 0, pend_sub = 0, pend_comp = 0;
 
     // Turns are keyed by a monotonically increasing index; each dispatch.turn
@@ -220,6 +223,7 @@ static void process_event(Stats& s) {
         t.model = field(pl, "model");
         t.route = field(pl, "route");
         t.provider = field(pl, "provider");
+        if (t.provider.empty()) t.provider = s.pend_provider;  // falls back to last provider.select
         t.effort = field(pl, "effort");
         t.tools = field_num(pl, "tools");
         t.ctx_window = field_num(pl, "ctx_window");
@@ -329,7 +333,8 @@ static void process_event(Stats& s) {
             s.error_turn_samples.push_back(s.cur_ts + " conn_fail " + field(pl, "host"));
     }
     else if (ev == "provider.select") {
-        s.provider_count[field(pl, "provider")]++;
+        s.pend_provider = field(pl, "provider");
+        s.provider_count[s.pend_provider]++;
     }
     else if (ev == "openai.auth") {
         // routine informational line, NOT a failure — do not count as an error
@@ -408,22 +413,423 @@ static bool process_file(Stats& s, const char* path) {
 }
 
 // ---------------------------------------------------------------------------
+// Minimal JSON parser + models.dev pricing (modelsdev.json)
+// ---------------------------------------------------------------------------
+// modelsdev.json is the agentty cache of https://models.dev/api.json:
+//   { "<provider-id>": { ... "models": { "<model-key>": { ...
+//       "cost": { "input": <USD/1M>, "output": <USD/1M>,
+//                  "cache_read": ..., "cache_write": ... } } } } }
+// All cost values are United States Dollars per 1M tokens. `cost` is absent
+// for free/local models. We only need a read-only walk of the tree, so a
+// compact recursive-descent parser (no external JSON dependency) suffices.
+
+struct ModelCost {
+    double in = 0, out = 0, cache_read = 0, cache_write = 0;  // USD per 1M tokens
+};
+
+struct Pricing {
+    // model key (as listed under a provider's "models", e.g.
+    // "claude-sonnet-4-6" or "z-ai/glm-5.2") -> (provider, costs). A key may
+    // exist under several providers (resellers) with different prices.
+    map<string, vector<std::pair<string, ModelCost>>> by_key;
+    // provider -> model keys the provider lists, regardless of cost. Used for
+    // plan-detection: an entry here with no by_key entry means the provider
+    // serves the model without a published price (plan/subscription).
+    map<string, vector<string>> by_provider;
+    // provider -> API base URL from the provider object's "api" field
+    // (e.g. ollama-cloud -> "https://ollama.com/v1"). Used to match log-side
+    // endpoint ids like "https://ollama.com/v1#main" to a models.dev provider.
+    map<string, string> api;
+    string path;                        // file the pricing was loaded from
+    bool loaded = false;
+};
+
+namespace json {
+
+struct Val {
+    enum Kind { NUL, BOOL, NUM, STR, ARR, OBJ } kind = NUL;
+    bool b = false;
+    double num = 0;
+    string str;
+    vector<std::unique_ptr<Val>> arr;
+    vector<std::pair<string, std::unique_ptr<Val>>> obj;
+    const Val* find(const string& key) const {
+        if (kind != OBJ) return nullptr;
+        for (const auto& kv : obj) if (kv.first == key) return kv.second.get();
+        return nullptr;
+    }
+};
+
+struct Parser {
+    const char* p;
+    const char* end;
+    bool ok = true;
+
+    void skip_ws() {
+        while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
+    }
+    bool at_end() { skip_ws(); return p >= end; }
+
+    string parse_string() {
+        string out;
+        p++;  // opening quote
+        while (p < end && *p != '"') {
+            char c = *p++;
+            if (c == '\\') {
+                if (p >= end) { ok = false; break; }
+                char e = *p++;
+                switch (e) {
+                    case '"':  out += '"';  break;
+                    case '\\': out += '\\'; break;
+                    case '/':  out += '/';  break;
+                    case 'n':  out += '\n'; break;
+                    case 't':  out += '\t'; break;
+                    case 'r':  out += '\r'; break;
+                    case 'b': case 'f': break;
+                    case 'u':  // skip 4 hex digits; model keys/ids are ASCII
+                        if (end - p >= 4) p += 4; else ok = false;
+                        break;
+                    default: ok = false; break;
+                }
+            } else {
+                out += c;
+            }
+        }
+        if (p >= end) { ok = false; return out; }
+        p++;  // closing quote
+        return out;
+    }
+
+    bool parse_number(double& out) {
+        char* e = nullptr;
+        double d = strtod(const_cast<char*>(p), &e);
+        if (e == p) { ok = false; return false; }
+        out = d;
+        p = e;
+        return true;
+    }
+
+    bool parse_value(std::unique_ptr<Val>& v, int depth) {
+        if (depth > 64) { ok = false; return false; }
+        skip_ws();
+        if (p >= end) { ok = false; return false; }
+        char c = *p;
+        if (c == '{') {
+            v->kind = Val::OBJ; p++;
+            skip_ws();
+            if (p < end && *p == '}') { p++; return true; }
+            while (ok) {
+                skip_ws();
+                if (p >= end || *p != '"') { ok = false; break; }
+                string key = parse_string();
+                if (!ok) break;
+                skip_ws();
+                if (p >= end || *p != ':') { ok = false; break; }
+                p++;
+                std::unique_ptr<Val> child(new Val());
+                if (!parse_value(child, depth + 1)) break;
+                v->obj.push_back({key, std::move(child)});
+                skip_ws();
+                if (p < end && *p == ',') { p++; continue; }
+                if (p < end && *p == '}') { p++; return true; }
+                ok = false;
+            }
+            return false;
+        }
+        if (c == '[') {
+            v->kind = Val::ARR; p++;
+            skip_ws();
+            if (p < end && *p == ']') { p++; return true; }
+            while (ok) {
+                std::unique_ptr<Val> child(new Val());
+                if (!parse_value(child, depth + 1)) break;
+                v->arr.push_back(std::move(child));
+                skip_ws();
+                if (p < end && *p == ',') { p++; continue; }
+                if (p < end && *p == ']') { p++; return true; }
+                ok = false;
+            }
+            return false;
+        }
+        if (c == '"') { v->kind = Val::STR; v->str = parse_string(); return ok; }
+        if (c == 't') { if (end - p >= 4 && strncmp(p, "true", 4) == 0) { v->kind = Val::BOOL; v->b = true; p += 4; return true; } ok = false; return false; }
+        if (c == 'f') { if (end - p >= 5 && strncmp(p, "false", 5) == 0) { v->kind = Val::BOOL; p += 5; return true; } ok = false; return false; }
+        if (c == 'n') { if (end - p >= 4 && strncmp(p, "null", 4) == 0) { v->kind = Val::NUL; p += 4; return true; } ok = false; return false; }
+        if (parse_number(v->num)) { v->kind = Val::NUM; return true; }
+        return false;
+    }
+};
+
+}  // namespace json
+
+// ---------------------------------------------------------------------------
+// Pricing: load modelsdev.json and resolve log model names to USD rates
+// ---------------------------------------------------------------------------
+
+static double cost_num(const json::Val* cost, const char* key) {
+    if (!cost) return 0;
+    const json::Val* v = cost->find(key);
+    return (v && v->kind == json::Val::NUM) ? v->num : 0;
+}
+
+// Walk providers -> models -> cost{} and flatten into Pricing. Every (key,
+// provider) pair is kept; reseller prices differ, and log turns usually carry
+// provider= so the right entry can be picked during resolution.
+static bool pricing_from_json(const string& buf, Pricing& pr) {
+    json::Parser ps{buf.data(), buf.data() + buf.size()};
+    std::unique_ptr<json::Val> root(new json::Val());
+    if (!ps.parse_value(root, 0)) return false;
+    ps.skip_ws();
+    if (!ps.at_end()) return false;
+    if (root->kind != json::Val::OBJ) return false;
+    for (const auto& pv : root->obj) {
+        const string& provider = pv.first;
+        const json::Val* api = pv.second->find("api");
+        if (api && api->kind == json::Val::STR) pr.api[provider] = api->str;
+        const json::Val* models = pv.second->find("models");
+        if (!models || models->kind != json::Val::OBJ) continue;
+        for (const auto& mv : models->obj) {
+            pr.by_provider[provider].push_back(mv.first);
+            const json::Val* cost = mv.second->find("cost");
+            if (!cost || cost->kind != json::Val::OBJ) continue;  // free/plan/local model
+            ModelCost mc;
+            mc.in = cost_num(cost, "input");
+            mc.out = cost_num(cost, "output");
+            mc.cache_read = cost_num(cost, "cache_read");
+            mc.cache_write = cost_num(cost, "cache_write");
+            pr.by_key[mv.first].push_back({provider, mc});
+        }
+    }
+    return !pr.by_key.empty() || !pr.by_provider.empty();
+}
+
+// Load the pricing file. Returns false if the path was explicitly given
+// (flag or env) but unreadable, or the file exists but doesn't parse.
+//   missing_default_path : a default-candidate path did not exist -> caller
+//                          should try the next candidate, not hard-fail.
+static bool load_pricing(const string& path, Pricing& pr, bool& missing_default_path) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) {
+        missing_default_path = true;
+        return false;
+    }
+    missing_default_path = false;
+    string buf;
+    {
+        char chunk[65536];
+        size_t n;
+        while ((n = fread(chunk, 1, sizeof chunk, f)) > 0) buf.append(chunk, n);
+    }
+    bool closed = (fclose(f) == 0);
+    if (!closed || buf.empty() || !pricing_from_json(buf, pr)) return false;
+    pr.path = path;
+    pr.loaded = true;
+    return true;
+}
+
+struct Rate {          // resolved USD-per-1M-token rates
+    double in = 0, out = 0;
+    bool exact = true; // false when matched by fuzzy date-prefix
+    bool plan = false; // provider known to serve the model with no published price (plan/subscription)
+    string provider;   // models.dev provider whose entry was used
+    string source;     // provenance label, e.g. "models.dev (ollama-cloud)"
+};
+
+// True when the string looks like a URL/endpoint id rather than a models.dev
+// provider id (log providers are agentty endpoint ids, e.g.
+// "https://ollama.com/v1#main" or "ollama.com/v1/chat/completions").
+static bool looks_like_url(const string& s) {
+    return s.find("://") != string::npos || s.find('/') != string::npos;
+}
+
+// Map a log-side provider value to a models.dev provider id: exact id first,
+// then match the URL base against the providers' "api" fields. Longest api
+// base wins so a more specific path beats a shorter shared host.
+static string match_provider(const Pricing& pr, const string& provider) {
+    if (provider.empty()) return "";
+    if (!looks_like_url(provider)) return provider;  // already a provider id (or name)
+    string base = provider;
+    size_t hash = base.find('#');
+    if (hash != string::npos) base.resize(hash);
+    const string* best = nullptr;
+    size_t best_len = 0;
+    for (const auto& kv : pr.api)
+        if (kv.second.size() > best_len && base.compare(0, kv.second.size(), kv.second) == 0) {
+            best = &kv.first;
+            best_len = kv.second.size();
+        }
+    return best ? *best : "";
+}
+
+// Plan detection under a specific provider: model key is listed but has no
+// published cost object -> plan/subscription-served, honestly $0.
+static bool plan_for_key(const Pricing& pr, const string& key, const string& prov, Rate& r) {
+    if (prov.empty()) return false;
+    auto it = pr.by_provider.find(prov);
+    if (it == pr.by_provider.end()) return false;
+    for (const string& k : it->second)
+        if (k == key) {
+            r.in = r.out = 0;
+            r.plan = true;
+            r.provider = prov;
+            r.source = "models.dev (" + prov + ")";
+            return true;
+        }
+    return false;
+}
+
+// Exact-key cost resolution for one candidate key against the pricing table.
+// Truthfulness order: the turn's provider (matched by id or API URL) always
+// wins — including a plan/uncosted entry there, which is reported as $0
+// rather than silently re-priced from a reseller. Only when the provider is
+// unknown do we fall back to the cheapest metered (non-zero) rate, and the
+// Source column says which entry the number actually came from.
+static bool cost_for_key(const Pricing& pr, const string& key, const string& provider, Rate& r) {
+    string prov = match_provider(pr, provider);
+    auto it = pr.by_key.find(key);
+    if (it != pr.by_key.end()) {
+        const vector<std::pair<string, ModelCost>>& cands = it->second;
+        if (!prov.empty()) {
+            // When the turn's provider is known, its own listing decides:
+            // costed entry -> use it; listed but uncosted -> plan ($0).
+            // Never substitute another provider's price for it.
+            for (const auto& cand : cands)
+                if (cand.first == prov) {
+                    r.in = cand.second.in;
+                    r.out = cand.second.out;
+                    r.provider = prov;
+                    r.source = "models.dev (" + prov + ")";
+                    r.exact = true;
+                    return true;
+                }
+            if (plan_for_key(pr, key, prov, r)) return true;
+        }
+        // Provider unknown (or doesn't list this model): cheapest metered
+        // (non-zero) rate; costless plan entries never fill in here.
+        const std::pair<string, ModelCost>* best = nullptr;
+        for (const auto& cand : cands)
+            if (cand.second.in > 0 || cand.second.out > 0)
+                if (!best || cand.second.in < best->second.in) best = &cand;
+        if (best) {
+            r.in = best->second.in;
+            r.out = best->second.out;
+            r.provider = best->first;
+            r.source = "models.dev (" + best->first + ")";
+            r.exact = true;
+            return true;
+        }
+        // All-costless key belongs to some other provider; not priceable.
+        return false;
+    }
+    return plan_for_key(pr, key, prov, r);
+}
+
+// Resolve a log model name to rates. Order: exact key (matched provider,
+// incl. plan entries), then the listed key whose trailing date stamp is
+// stripped ("gpt-5.1-2025-11-13" -> "gpt-5.1", "glm-5.2-20251113" ->
+// "glm-5.2"), else not priced.
+static bool resolve_cost(const Pricing& pr, const string& model, const string& provider, Rate& r) {
+    if (model.empty() || !pr.loaded) return false;
+    if (cost_for_key(pr, model, provider, r)) return true;
+    static const std::regex DATE_STAMP_RE("-(\\d{4}-\\d{2}-\\d{2}|\\d{8,14})$");
+    std::smatch dm;
+    if (std::regex_search(model, dm, DATE_STAMP_RE)) {
+        string base = model.substr(0, model.size() - dm[0].length());
+        Rate fr;
+        if (!base.empty() && cost_for_key(pr, base, provider, fr)) {
+            r = fr;
+            r.exact = false;   // matched via date-suffix normalisation
+            return true;
+        }
+    }
+    return false;
+}
+
+// Format a USD amount: enough precision for sub-cent values, trimmed for big ones.
+static string usd_fmt(double v) {
+    char b[64];
+    double a = v < 0 ? -v : v;
+    if (a > 0 && a < 0.01)      snprintf(b, sizeof b, "$%.6f", v);
+    else if (a >= 1000)         snprintf(b, sizeof b, "$%.2f", v);
+    else                        snprintf(b, sizeof b, "$%.4f", v);
+    return b;
+}
+
+// Per-model cost accumulator (USD, rates from models.dev).
+struct CostAcc {
+    long long turns = 0;
+    double rate_in = 0, rate_out = 0;   // USD per 1M tokens
+    double input_usd = 0, output_usd = 0, total_usd = 0;
+    bool exact_rate = true;
+    bool plan = false;
+    string provider;
+    string source;
+};
+
+// Sort a string->count map into a vector ordered by count descending (then
+// key ascending, for stable tie-breaks). Used by every two-column report
+// table so the biggest items lead.
+static vector<std::pair<string, long long>> sorted_pairs(const map<string, long long>& m) {
+    vector<std::pair<string, long long>> v(m.begin(), m.end());
+    std::stable_sort(v.begin(), v.end(),
+                     [](const std::pair<string, long long>& a, const std::pair<string, long long>& b) {
+                         if (a.second != b.second) return a.second > b.second;
+                         return a.first < b.first;
+                     });
+    return v;
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
 int main(int argc, char** argv) {
-    if (argc < 3) {
-        fprintf(stderr, "usage: %s <log-file>... <output-file>\n", argv[0]);
+    // Arg parsing: <log-file>... <output.md> [--cost /path/to/modelsdev.json] [--no-cost]
+    vector<const char*> pos;
+    bool no_cost = false;
+    const char* cost_flag = nullptr;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--no-cost") == 0) { no_cost = true; continue; }
+        if (strcmp(argv[i], "--cost") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: --cost requires a path argument\n");
+                return 2;
+            }
+            cost_flag = argv[++i];
+            continue;
+        }
+        pos.push_back(argv[i]);
+    }
+    if (pos.size() < 2) {
+        fprintf(stderr, "usage: %s <log-file>... <output.md> [--cost /path/to/modelsdev.json] [--no-cost]\n", argv[0]);
         return 2;
     }
-    const char* out_path = argv[argc - 1];
-    int n_inputs = argc - 2;
+    const char* out_path = pos.back();
+    size_t n_inputs = pos.size() - 1;
+
+    // Resolve the models.dev pricing file (default: agentty's cache).
+    // NOTE: default path is NOT auto-created; see error message below when missing.
+    const char* pricing_path = cost_flag;
+    bool pricing_default = false;
+    if (!no_cost && !pricing_path) {
+        const char* envp = getenv("AGENTTY_MODELS_DEV");
+        if (envp && *envp) pricing_path = envp;
+    }
+    if (!no_cost && !pricing_path) {
+        static char cand[4096];
+        const char* home = getenv("HOME");
+        const char* prof = getenv("USERPROFILE");
+        if (home && *home)        { snprintf(cand, sizeof cand, "%s/.agentty/cache/modelsdev.json", home); pricing_path = cand; }
+        else if (prof && *prof)   { snprintf(cand, sizeof cand, "%s/.agentty/cache/modelsdev.json", prof); pricing_path = cand; }
+        else                      { pricing_path = "~/.agentty/cache/modelsdev.json"; }
+        pricing_default = true;
+    }
 
     Stats s;
     vector<string> sources;
-    for (int i = 1; i <= n_inputs; i++) {
-        if (!process_file(s, argv[i])) return 1;
-        sources.push_back(argv[i]);
+    for (size_t i = 0; i < n_inputs; i++) {
+        if (!process_file(s, pos[i])) return 1;
+        sources.push_back(pos[i]);
     }
 
     // ---- Aggregate per-model and totals from turns ----
@@ -442,7 +848,72 @@ int main(int argc, char** argv) {
         s.total_completion += t.completion_tokens;
     }
 
+    // ---- Cost: resolve rates and accumulate per-model USD ----
+    // Rates come from agentty's models.dev cache; see load_pricing().
+    Pricing pricing;
+    bool pricing_missing = false;      // default candidate path did not exist
+    bool pricing_bad = false;          // explicitly given but unreadable/unparseable
+    bool pricing_enabled = !no_cost;
+    if (pricing_enabled) {
+        bool skip;
+        if (!load_pricing(pricing_path, pricing, skip)) {
+            if (skip && pricing_default) pricing_missing = true;
+            else pricing_bad = true;
+            pricing_enabled = false;
+        }
+    }
+    map<string, CostAcc> cost_acc;
+    if (pricing_enabled) {
+        // Prefer each turn's provider when the same model key exists under
+        // several providers (resellers); keep per-provider rates in the row.
+        for (Turn& t : s.turn_list) {
+            if (t.model.empty()) continue;
+            Rate r;
+            if (!resolve_cost(pricing, t.model, t.provider, r)) continue;
+            CostAcc& a = cost_acc[t.model];
+            if (a.turns == 0) {
+                a.rate_in = r.in;
+                a.rate_out = r.out;
+                a.exact_rate = r.exact;
+                // Always report the models.dev provider whose rates were
+                // used; the log-side provider id (e.g. an agentty endpoint
+                // like "https://ollama.com/v1#main") is not a models.dev key
+                // and would misattribute the price.
+                a.provider = r.provider;
+                a.plan = r.plan;
+                a.source = r.source;
+            } else if (r.exact && (r.in != a.rate_in || r.out != a.rate_out)) {
+                a.exact_rate = false;  // mixed rates across turns/providers
+                a.plan = false;
+            }
+            a.turns++;
+            a.input_usd += (double)t.prompt_tokens / 1e6 * r.in;
+            a.output_usd += (double)t.completion_tokens / 1e6 * r.out;
+            a.total_usd = a.input_usd + a.output_usd;
+        }
+    }
+
     // ---- Build report ----
+    if (pricing_missing || pricing_bad) {
+        fprintf(stderr,
+            "error: modelsdev.json %s at '%s'.\n"
+            "\n"
+            "Cost reporting requires the models.dev pricing cache that agentty\n"
+            "refreshes every 24 hours, normally at:\n"
+            "    $AGENTTY_HOME/cache/modelsdev.json   (default: ~/.agentty/cache/modelsdev.json)\n"
+            "\n"
+            "Fix it by pointing agentty-stats at the file, then re-run:\n"
+            "    agentty-stats <log-files>... <output.md> --cost /path/to/modelsdev.json\n"
+            "or export AGENTTY_MODELS_DEV=/path/to/modelsdev.json\n"
+            "\n"
+            "If AGENTTY_HOME is set to a non-default location, use:\n"
+            "    --cost \"$AGENTTY_HOME/cache/modelsdev.json\"\n"
+            "\n"
+            "To skip cost reporting entirely, re-run with --no-cost.\n",
+            pricing_missing ? "was not found" : "exists but could not be parsed",
+            pricing_path);
+        return 1;
+    }
     std::ostringstream o;
     o << "# agentty — Session Statistics Report\n\n";
     o << "**Source";
@@ -454,6 +925,9 @@ int main(int argc, char** argv) {
     }
     o << "\n\n";
     o << "**Generated:** " << s.last_ts << "\n\n";
+    if (!no_cost) {
+        o << "**Pricing source:** [models.dev](https://models.dev) (agentty cache: `" << pricing_path << "`, USD per 1M tokens)\n\n";
+    }
     o << "---\n\n";
 
     // 1. Overview
@@ -470,6 +944,11 @@ int main(int argc, char** argv) {
     o << "| Total prompt tokens | " << human_tokens(s.total_prompt) << " (" << s.total_prompt << ") |\n";
     o << "| Total completion tokens | " << human_tokens(s.total_completion) << " (" << s.total_completion << ") |\n";
     o << "| Total tokens | " << human_tokens(s.total_prompt + s.total_completion) << " |\n";
+    {
+        double grand = 0;
+        for (auto& kv : cost_acc) grand += kv.second.total_usd;
+        o << "| Estimated cost | " << (cost_acc.empty() ? "n/a" : usd_fmt(grand) + (pricing_enabled ? "" : " (pricing unavailable)")) << " |\n";
+    }
     o << "| Wire chunks | " << s.total_chunks << " (" << human_bytes(s.total_chunk_bytes) << ") |\n";
     o << "| Request bytes | " << human_bytes(s.total_request_bytes) << " |\n";
     o << "| Tool calls | " << ([] (const map<string,ToolStat>& t){ long long n=0; for(auto&kv:t)n+=kv.second.calls; return n; })(s.tools) << " |\n";
@@ -494,19 +973,19 @@ int main(int argc, char** argv) {
     // 2. Log volume by level / component / event
     o << "## 2. Log volume\n\n";
     o << "### By level\n\n| Level | Count |\n|---|---|\n";
-    for (auto& kv : s.level_count) o << "| " << kv.first << " | " << kv.second << " |\n";
+    for (auto& kv : sorted_pairs(s.level_count)) o << "| " << kv.first << " | " << kv.second << " |\n";
     o << "\n### By component\n\n| Component | Count |\n|---|---|\n";
-    for (auto& kv : s.component_count) o << "| " << kv.first << " | " << kv.second << " |\n";
+    for (auto& kv : sorted_pairs(s.component_count)) o << "| " << kv.first << " | " << kv.second << " |\n";
     o << "\n### By event\n\n| Event | Count |\n|---|---|\n";
-    for (auto& kv : s.event_count) o << "| " << kv.first << " | " << kv.second << " |\n";
+    for (auto& kv : sorted_pairs(s.event_count)) o << "| " << kv.first << " | " << kv.second << " |\n";
     o << "\n";
 
     // 3. Smart-mode routing
     o << "## 3. Smart-mode routing\n\n";
     o << "### Role\n\n| Role | Turns |\n|---|---|\n";
-    for (auto& kv : s.role_count) o << "| " << kv.first << " | " << kv.second << " |\n";
+    for (auto& kv : sorted_pairs(s.role_count)) o << "| " << kv.first << " | " << kv.second << " |\n";
     o << "\n### Complexity\n\n| Complexity | Turns |\n|---|---|\n";
-    for (auto& kv : s.complexity_count) o << "| " << kv.first << " | " << kv.second << " |\n";
+    for (auto& kv : sorted_pairs(s.complexity_count)) o << "| " << kv.first << " | " << kv.second << " |\n";
     o << "\n### Orchestration flags\n\n";
     {
         long long orch=0, sub=0, comp=0;
@@ -521,44 +1000,118 @@ int main(int argc, char** argv) {
     o << "## 4. Per-model usage\n\n";
     o << "| Model | Turns | Prompt tok | Completion tok | Total tok | Req bytes | Chunk bytes | Chunks | Retried | Errors |\n";
     o << "|---|---|---|---|---|---|---|---|---|---|\n";
-    for (auto& kv : s.models) {
-        const ModelStat& ms = kv.second;
-        o << "| " << kv.first << " | " << ms.turns
-          << " | " << human_tokens(ms.prompt_tokens)
-          << " | " << human_tokens(ms.completion_tokens)
-          << " | " << human_tokens(ms.prompt_tokens + ms.completion_tokens)
-          << " | " << human_bytes(ms.request_bytes)
-          << " | " << human_bytes(ms.chunk_bytes)
-          << " | " << ms.chunks
-          << " | " << ms.retried_turns
-          << " | " << ms.errors << " |\n";
+    {
+        vector<const std::pair<const string, ModelStat>*> model_rows;
+        for (const auto& kv : s.models) model_rows.push_back(&kv);
+        std::stable_sort(model_rows.begin(), model_rows.end(),
+                         [](const std::pair<const string, ModelStat>* a,
+                            const std::pair<const string, ModelStat>* b) {
+                             if (a->second.turns != b->second.turns) return a->second.turns > b->second.turns;
+                             return a->first < b->first;
+                         });
+        for (const auto* kv : model_rows) {
+            const string& name = kv->first;
+            const ModelStat& ms = kv->second;
+            o << "| " << name << " | " << ms.turns
+              << " | " << human_tokens(ms.prompt_tokens)
+              << " | " << human_tokens(ms.completion_tokens)
+              << " | " << human_tokens(ms.prompt_tokens + ms.completion_tokens)
+              << " | " << human_bytes(ms.request_bytes)
+              << " | " << human_bytes(ms.chunk_bytes)
+              << " | " << ms.chunks
+              << " | " << ms.retried_turns
+              << " | " << ms.errors << " |\n";
+        }
     }
     o << "\n";
+
+    // 4b. Cost (USD) — rates from models.dev via agentty's cache
+    o << "## 4b. Cost (USD)\n\n";
+    o << "*Prices from [models.dev](https://models.dev), loaded from `" << pricing_path
+      << "`; all amounts are United States Dollars (USD). Cost = prompt/1M × input-rate + completion/1M × output-rate.*\n\n";
+    if (no_cost) {
+        o << "*Cost reporting disabled (`--no-cost`).*\n\n";
+    } else if (cost_acc.empty()) {
+        o << "*No priced models: none of the models in the logs could be matched to a models.dev entry.*\n\n";
+    } else {
+        o << "| Model | Provider | $/1M in | $/1M out | Turns | Input cost | Output cost | Total cost | Source |\n";
+        o << "|---|---|---|---|---|---|---|---|---|\n";
+        vector<const std::pair<const string, CostAcc>*> cost_rows;
+        for (const auto& kv : cost_acc) cost_rows.push_back(&kv);
+        std::stable_sort(cost_rows.begin(), cost_rows.end(),
+                         [](const std::pair<const string, CostAcc>* a,
+                            const std::pair<const string, CostAcc>* b) {
+                             if (a->second.total_usd != b->second.total_usd)
+                                 return a->second.total_usd > b->second.total_usd;
+                             return a->first < b->first;
+                         });
+        double grand_in = 0, grand_out = 0, grand_total = 0;
+        for (const auto* kv : cost_rows) {
+            const string& name = kv->first;
+            const CostAcc& a = kv->second;
+            grand_in += a.input_usd;
+            grand_out += a.output_usd;
+            grand_total += a.total_usd;
+            o << "| " << name
+              << " | " << (a.provider.empty() ? "-" : a.provider) << (a.plan ? " (plan)" : "")
+              << " | " << a.rate_in
+              << " | " << a.rate_out
+              << " | " << a.turns
+              << " | " << usd_fmt(a.input_usd)
+              << " | " << usd_fmt(a.output_usd)
+              << " | " << usd_fmt(a.total_usd)
+              << (a.exact_rate ? "" : " (approx.)")
+              << " | " << (a.source.empty() ? "-" : a.source)
+              << " |\n";
+        }
+        o << "| **Total** | | | | | " << usd_fmt(grand_in) << " | " << usd_fmt(grand_out) << " | **" << usd_fmt(grand_total) << "** | |\n\n";
+        long long unpriced_turns = 0;
+        for (auto& kv : s.models) {
+            if (cost_acc.count(kv.first)) continue;
+            unpriced_turns += kv.second.turns;
+            o << "*No pricing data for model `" << kv.first << "` (" << kv.second.turns
+              << " turns, " << human_tokens(kv.second.prompt_tokens + kv.second.completion_tokens) << " tokens) — excluded from cost totals.*\n";
+        }
+        if (unpriced_turns) o << "\n";
+        o << "*Note: every rate above comes from [models.dev](https://models.dev) (agentty's pricing cache) unless a provider's public API exposes a token price directly — none currently does in these logs. "
+             "Endpoint URLs from the log (e.g. `https://ollama.com/v1#main`) are resolved to the models.dev provider advertising the same API base; a model listed there without a published cost is shown as `(plan)` at $0.00. "
+             "Estimates use input/output token counts from the logs; cache-read/cache-write tokens are not logged and are therefore not reflected in these figures.*\n\n";
+    }
 
     // 5. Tool usage
     o << "## 5. Tool usage\n\n";
     o << "| Tool | Calls | Total | Avg | Max | ok | err |\n";
     o << "|---|---|---|---|---|---|---|\n";
-    for (auto& kv : s.tools) {
-        const ToolStat& ts = kv.second;
-        o << "| " << kv.first << " | " << ts.calls
-          << " | " << human_ms(ts.total_ms)
-          << " | " << human_ms(ts.calls ? ts.total_ms / ts.calls : 0)
-          << " | " << human_ms(ts.max_ms)
-          << " | " << ts.ok << " | " << ts.err << " |\n";
+    {
+        vector<const std::pair<const string, ToolStat>*> tool_rows;
+        for (const auto& kv : s.tools) tool_rows.push_back(&kv);
+        std::stable_sort(tool_rows.begin(), tool_rows.end(),
+                         [](const std::pair<const string, ToolStat>* a,
+                            const std::pair<const string, ToolStat>* b) {
+                             if (a->second.calls != b->second.calls) return a->second.calls > b->second.calls;
+                             return a->first < b->first;
+                         });
+        for (const auto* kv : tool_rows) {
+            const ToolStat& ts = kv->second;
+            o << "| " << kv->first << " | " << ts.calls
+              << " | " << human_ms(ts.total_ms)
+              << " | " << human_ms(ts.calls ? ts.total_ms / ts.calls : 0)
+              << " | " << human_ms(ts.max_ms)
+              << " | " << ts.ok << " | " << ts.err << " |\n";
+        }
     }
     o << "\n";
 
     // 6. Wire / streaming
     o << "## 6. Wire / streaming\n\n";
     o << "### Stop reasons\n\n| Stop | Count |\n|---|---|\n";
-    for (auto& kv : s.stop_count) o << "| " << kv.first << " | " << kv.second << " |\n";
+    for (auto& kv : sorted_pairs(s.stop_count)) o << "| " << kv.first << " | " << kv.second << " |\n";
     o << "\n### HTTP status\n\n| Status | Count |\n|---|---|\n";
-    for (auto& kv : s.status_count) o << "| " << kv.first << " | " << kv.second << " |\n";
+    for (auto& kv : sorted_pairs(s.status_count)) o << "| " << kv.first << " | " << kv.second << " |\n";
     o << "\n### Hosts\n\n| Host | Count |\n|---|---|\n";
-    for (auto& kv : s.host_count) o << "| " << kv.first << " | " << kv.second << " |\n";
+    for (auto& kv : sorted_pairs(s.host_count)) o << "| " << kv.first << " | " << kv.second << " |\n";
     o << "\n### Providers\n\n| Provider | Count |\n|---|---|\n";
-    for (auto& kv : s.provider_count) o << "| " << kv.first << " | " << kv.second << " |\n";
+    for (auto& kv : sorted_pairs(s.provider_count)) o << "| " << kv.first << " | " << kv.second << " |\n";
     o << "\n";
 
     // 6b. Failures & retries
@@ -583,17 +1136,18 @@ int main(int argc, char** argv) {
         o << "\n";
         if (!s.http_error_status.empty()) {
             o << "### HTTP error status\n\n| Status | Count |\n|---|---|\n";
-            for (auto& kv : s.http_error_status) o << "| " << kv.first << " | " << kv.second << " |\n";
+            for (auto& kv : sorted_pairs(s.http_error_status)) o << "| " << kv.first << " | " << kv.second << " |\n";
             o << "\n";
         }
         if (!s.retry_attempts.empty()) {
             o << "### Retry attempts\n\n| Attempt | Count |\n|---|---|\n";
-            for (auto& kv : s.retry_attempts) o << "| " << kv.first << " | " << kv.second << " |\n";
+            for (auto& kv : s.retry_attempts)
+                o << "| " << kv.first << " | " << kv.second << " |\n";
             o << "\n";
         }
         if (!s.stream_error_class.empty()) {
             o << "### stream.error classes\n\n| Class | Count |\n|---|---|\n";
-            for (auto& kv : s.stream_error_class) o << "| " << kv.first << " | " << kv.second << " |\n";
+            for (auto& kv : sorted_pairs(s.stream_error_class)) o << "| " << kv.first << " | " << kv.second << " |\n";
             o << "\n";
         }
         if (!s.error_turn_samples.empty()) {
@@ -606,8 +1160,8 @@ int main(int argc, char** argv) {
 
     // 7. Turn-by-turn detail
     o << "## 7. Turn-by-turn detail\n\n";
-    o << "| # | Model | Complexity | Stop | Retry | Prompt | Completion | Chunks | Bytes | Duration |\n";
-    o << "|---|---|---|---|---|---|---|---|---|---|\n";
+    o << "| # | Model | Complexity | Stop | Retry | Prompt | Completion | Cost | Chunks | Bytes | Duration |\n";
+    o << "|---|---|---|---|---|---|---|---|---|---|---|\n";
     {
         vector<const Turn*> ordered;
         for (Turn& t : s.turn_list) ordered.push_back(&t);
@@ -616,6 +1170,12 @@ int main(int argc, char** argv) {
         int i = 1;
         for (const Turn* t : ordered) {
             long long dur = (t->has_end && t->wall_end_ms >= t->wall_start_ms) ? (t->wall_end_ms - t->wall_start_ms) : 0;
+            string turn_cost = "-";
+            if (pricing_enabled && !t->model.empty()) {
+                Rate r;
+                if (resolve_cost(pricing, t->model, t->provider, r))
+                    turn_cost = usd_fmt((double)t->prompt_tokens / 1e6 * r.in + (double)t->completion_tokens / 1e6 * r.out);
+            }
             o << "| " << i++
               << " | " << (t->model.empty() ? "-" : t->model)
               << " | " << (t->complexity.empty() ? "-" : t->complexity)
@@ -623,6 +1183,7 @@ int main(int argc, char** argv) {
               << " | " << t->retry
               << " | " << human_tokens(t->prompt_tokens)
               << " | " << human_tokens(t->completion_tokens)
+              << " | " << turn_cost
               << " | " << t->chunks
               << " | " << human_bytes(t->chunk_bytes)
               << " | " << human_ms(dur) << " |\n";
@@ -636,7 +1197,7 @@ int main(int argc, char** argv) {
         o << "No error-level events.\n\n";
     } else {
         o << "| Event | Count |\n|---|---|\n";
-        for (auto& kv : s.err_events) o << "| " << kv.first << " | " << kv.second << " |\n";
+        for (auto& kv : sorted_pairs(s.err_events)) o << "| " << kv.first << " | " << kv.second << " |\n";
         o << "\n**Samples:**\n\n```\n";
         for (auto& str : s.err_samples) o << str << "\n";
         o << "```\n\n";
@@ -656,7 +1217,7 @@ int main(int argc, char** argv) {
     fwrite(o.str().data(), 1, o.str().size(), out);
     fclose(out);
 
-    fprintf(stderr, "wrote %s (%zu bytes, %zu turns, %d file%s)\n",
+    fprintf(stderr, "wrote %s (%zu bytes, %zu turns, %zu file%s)\n",
             out_path, o.str().size(), s.turn_list.size(), n_inputs, n_inputs == 1 ? "" : "s");
     return 0;
 }
