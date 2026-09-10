@@ -52,6 +52,18 @@ static long long field_num(const string& s, const string& key) {
     return v.empty() ? 0 : atoll(v.c_str());
 }
 
+// Case-insensitive ASCII string equality (provider labels / model keys).
+static bool iequals(const string& a, const string& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); i++)
+        if (tolower((unsigned char)a[i]) != tolower((unsigned char)b[i])) return false;
+    return true;
+}
+
+// Defined with the pricing helpers below; used by the log parser to
+// normalize per-request endpoint URLs.
+static string norm_api(string a);
+
 static string human_bytes(long long n) {
     char buf[64];
     if (n < 1024)            snprintf(buf, sizeof buf, "%lld B", n);
@@ -104,12 +116,18 @@ static long long parse_ts_ms(const string& ts) {
 struct Turn {
     string id;
     string model;        // from dispatch.turn / openai.request
-    string role;         // from route.turn
+    string role;         // from route.turn (literal value — may be "none")
+    string role_inferred;// resolved role (route.turn's model mapped through router state)
     string complexity;   // simple | complex
+    int role_source = 0; // 0 = routed, 1 = model→role map, 2 = previous non-none
+    double cost = 0;
+    bool has_cost = false;
+    bool unpriced = false;
     string effort;
     string stop;         // tool_use | end_turn
     string route;
     string provider;
+    string api_base;     // normalized request URL base, e.g. "https://ollama.com/v1"
     long long tools = 0;
     long long ctx_window = 0;
     long long max_tokens = 0;
@@ -195,6 +213,13 @@ struct Stats {
     string pend_provider;   // last provider.select (persists across turns)
     int pend_orch = 0, pend_sub = 0, pend_comp = 0;
 
+    // Router state learned from genuinely-routed turns, used to resolve
+    // role=none turns (unrouted dispatches still execute under one of the
+    // user's configured tiers; route.turn's model= reveals which).
+    map<string, string> role_model_map; // model -> role (last routed)
+    string last_role;                   // last non-none role (in turn order)
+    string last_api_base;               // last openai.request URL base (persists across turns)
+
     // Turns are keyed by a monotonically increasing index; each dispatch.turn
     // opens a new turn and subsequent wire/stream events attach to it.
     vector<Turn> turn_list;
@@ -223,6 +248,10 @@ static void process_event(Stats& s) {
         s.pend_comp = (int)field_num(pl, "compacting");
         s.complexity_count[s.pend_complexity]++;
         s.role_count[s.pend_role]++;
+        // Learn the user's tier configuration: only a genuinely-routed turn
+        // authoritatively maps its model to a role.
+        if (s.pend_role != "none" && !s.pend_role.empty() && !s.pend_model.empty())
+            s.role_model_map[s.pend_model] = s.pend_role;
     }
     else if (ev == "dispatch.turn") {
         Turn t;
@@ -240,6 +269,7 @@ static void process_event(Stats& s) {
         if (t.retry > 0) s.retried_turns_total++;
         t.start_ms = s.cur_rel;
         t.wall_start_ms = parse_ts_ms(s.cur_ts);
+        t.api_base = s.last_api_base;   // most recent request URL base
         // attach pending router decision
         t.role = s.pend_role;
         t.complexity = s.pend_complexity;
@@ -247,6 +277,23 @@ static void process_event(Stats& s) {
         t.subagents = s.pend_sub;
         t.compacting = s.pend_comp;
         if (t.model.empty()) t.model = s.pend_model;
+        // Resolve the effective role. role=none means the router did not
+        // re-route this turn, but it still executed under one of the tiers:
+        // look the turn's model up in the router map learned from routed
+        // turns; for recurring 'none's fall back to the previous known role.
+        t.role_inferred = t.role;
+        if (t.role.empty() || t.role == "none") {
+            auto mi = s.role_model_map.find(t.model);
+            if (mi != s.role_model_map.end()) {
+                t.role_inferred = mi->second;
+                t.role_source = 1;
+            } else if (!s.last_role.empty()) {
+                t.role_inferred = s.last_role;
+                t.role_source = 2;
+            }
+        }
+        if (t.role_inferred != "none" && !t.role_inferred.empty())
+            s.last_role = t.role_inferred;
         s.turn_list.push_back(t);
         s.cur_turn = &s.turn_list.back();
     }
@@ -271,6 +318,32 @@ static void process_event(Stats& s) {
         if (s.cur_turn) {
             s.cur_turn->request_bytes += field_num(pl, "bytes");
             if (s.cur_turn->model.empty()) s.cur_turn->model = field(pl, "model");
+            // Per-request ground truth for the provider: the request URL.
+            // Reduce to a normalized base ("https://ollama.com/v1/chat/
+            // completions" -> "https://ollama.com/v1") so it can be matched
+            // against models.dev "api" fields after '#' stripping.
+            if (s.cur_turn->api_base.empty()) {
+                string pl2 = pl;
+                size_t p = pl2.find("POST ");
+                if (p == string::npos) p = pl2.find("GET ");
+                if (p != string::npos) {
+                    size_t u = pl2.find(' ', p);
+                    size_t e = pl2.find(' ', u + 1);
+                    string url = pl2.substr(u + 1, e == string::npos ? e : e - u - 1);
+                    std::smatch um;
+                    static const std::regex URL_RE("^(https?://[^/: ]+)(:(\\d+))?(/[^ ]*)?$");
+                    if (std::regex_match(url, um, URL_RE)) {
+                        string base = um[1].str();
+                        string path = um.size() > 4 ? um[4].str() : "";
+                        size_t cc = path.find("/chat/completions");
+                        if (cc != string::npos) path = path.substr(0, cc);
+                        size_t cm = path.find("/completions");
+                        if (cm != string::npos) path = path.substr(0, cm);
+                        s.cur_turn->api_base = norm_api(base + path);
+                        s.last_api_base = s.cur_turn->api_base;
+                    }
+                }
+            }
         }
         s.total_request_bytes += field_num(pl, "bytes");
     }
@@ -365,6 +438,33 @@ static void process_event(Stats& s) {
     }
 }
 
+// Lightweight pre-pass over one log file: scan only route.turn lines and
+// record genuinely-routed (role != none) model->role mappings into
+// s.role_model_map. Lets a file's tier configuration be learned even when
+// the routing evidence lives in a different input file.
+static void bootstrap_roles(Stats& s, const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return; // errors are reported by the main pass
+    static const std::regex ROUTE_RE(
+        R"(^\S+\s+\+\d+ms\s+\S+\s+[TDIWE]\s+\w+\s+route\.turn:\s?(.*)$)");
+    char* line = nullptr;
+    size_t cap = 0;
+    std::smatch m;
+    while (getline(&line, &cap, f) > 0) {
+        string sline(line);
+        if (!sline.empty() && sline.back() == '\n') sline.pop_back();
+        if (sline.find("route.turn") == string::npos) continue;
+        if (!std::regex_match(sline, m, ROUTE_RE)) continue;
+        string pl = m[1].str();
+        string role = field(pl, "role");
+        string model = field(pl, "model");
+        if (role != "none" && !role.empty() && !model.empty())
+            s.role_model_map[model] = role;
+    }
+    free(line);
+    fclose(f);
+}
+
 // Parse one log file into the shared Stats.
 static bool process_file(Stats& s, const char* path) {
     FILE* f = fopen(path, "rb");
@@ -382,12 +482,16 @@ static bool process_file(Stats& s, const char* path) {
     }
     s.source_files.push_back(sf);
 
-    // File boundary: nothing from a previous file may bleed into this one.
+    // File boundary: nothing from a previous file may bleed into this one,
+    // except role_model_map/last_role — the user's tier configuration is
+    // session-independent, so carry it forward (a session may legitimately
+    // run entirely under role=none when the router keeps the active model).
     s.have_cur = false;
     s.cur_turn = nullptr;
     s.pend_role.clear(); s.pend_complexity.clear(); s.pend_model.clear();
     s.pend_effort.clear(); s.pend_provider.clear();
     s.pend_orch = s.pend_sub = s.pend_comp = 0;
+    s.last_api_base.clear();
 
     static const std::regex LINE_RE(
         R"(^(\S+)\s+\+(\d+)ms\s+(\S+)\s+([TDIWE])\s+(\w+)\s+([\w.]+):\s?(.*)$)");
@@ -464,9 +568,65 @@ struct Pricing {
     // "claude-sonnet-4-6" or "z-ai/glm-5.2") -> (provider, costs). A key may
     // exist under several providers (resellers) with different prices.
     map<string, vector<std::pair<string, ModelCost>>> by_key;
-    string path;                        // file the pricing was loaded from
+    map<string, ModelCost> by_id;      // "provider-id\x1fmodel-key" + bare-alias entries
+    map<string, bool> key_provider;    // "model-key\x1fprovider-id": provider carries this model
+    map<string, string> api_to_id;     // normalized api URL -> provider id
+    map<string, string> id_name;       // provider id -> display name
+    string path;                    // file the pricing was loaded from
     bool loaded = false;
 };
+
+// Normalize a provider label / api URL for comparison: strip the account
+// disambiguator agentty appends ("#account" to end of string), collapse
+// "localhost" to "127.0.0.1", and drop a trailing "/". agentty labels
+// custom-host / localhost providers by their api URL, so this is the common
+// lookup form for them; flagship providers (Anthropic, Kimi, ...) carry
+// short labels matched via id_name/api_to_id instead.
+static string norm_api(string a) {
+    size_t h = a.find('#');
+    if (h != string::npos) a.erase(h);
+    while (!a.empty() && isspace((unsigned char)a.back())) a.pop_back();
+    while (!a.empty() && isspace((unsigned char)a.front())) a.erase(a.begin());
+    while (!a.empty() && a.back() == '/') a.pop_back();
+    for (size_t p; (p = a.find("://localhost")) != string::npos;)
+        a.replace(p, strlen("://localhost"), "://127.0.0.1");
+    // Drop explicit default ports (":443", ":80") so endpoints with and
+    // without them compare equal.
+    std::smatch pm;
+    static const std::regex PORT_RE("^(https?://[^/: ]+):(443|80)(/.*)?$");
+    if (std::regex_match(a, pm, PORT_RE))
+        a = pm[1].str() + (pm.size() > 3 ? pm[3].str() : "");
+    while (!a.empty() && a.back() == '/') a.pop_back();
+    return a;
+}
+
+// True when the provider label denotes inference on the user's own machine
+// (loopback hosts) — cost is defined as zero, not "unknown".
+static bool is_local_api(const string& n) {
+    return n.find("://127.0.0.1") != string::npos ||
+           n.find("://0.0.0.0") != string::npos ||
+           n.find("://[::1]") != string::npos;
+}
+
+// Map a turn's provider label to a canonical models.dev provider id.
+// Order: exact id, display name (case-insensitive), normalized api URL.
+static string provider_id_for(const Pricing& pr, const string& label,
+                              const string& api_base = "") {
+    if (pr.api_to_id.empty()) return "";   // no pricing loaded
+    if (!label.empty()) {
+        string clean = norm_api(label);
+        if (pr.id_name.count(clean)) return clean;          // exact id
+        for (const auto& kv : pr.id_name)
+            if (iequals(kv.second, clean)) return kv.first; // display name
+        auto it = pr.api_to_id.find(clean);
+        if (it != pr.api_to_id.end()) return it->second;    // api URL
+    }
+    if (!api_base.empty()) {
+        auto it2 = pr.api_to_id.find(norm_api(api_base));
+        if (it2 != pr.api_to_id.end()) return it2->second; // request-URL ground truth
+    }
+    return "";
+}
 
 namespace json {
 
@@ -608,17 +768,43 @@ static bool pricing_from_json(const string& buf, Pricing& pr) {
     if (root->kind != json::Val::OBJ) return false;
     for (const auto& pv : root->obj) {
         const string& provider = pv.first;
-        const json::Val* models = pv.second->find("models");
-        if (!models || models->kind != json::Val::OBJ) continue;
-        for (const auto& mv : models->obj) {
+        const json::Val* name_val = pv.second->find("name");
+        pr.id_name[provider] = (name_val && name_val->kind == json::Val::STR)
+                                   ? name_val->str : provider;
+        const json::Val* api_val = pv.second->find("api");
+        if (api_val && api_val->kind == json::Val::STR) {
+            string a = norm_api(api_val->str);
+            // First provider wins on a shared api URL: a provider and its
+            // "coding-plan" sibling share an endpoint, and per-model prices
+            // are what matter anyway.
+            if (!a.empty() && !pr.api_to_id.count(a)) pr.api_to_id[a] = provider;
+        }
+        const json::Val* models_obj = pv.second->find("models");
+        if (!models_obj || models_obj->kind != json::Val::OBJ) continue;
+        for (const auto& mv : models_obj->obj) {
             const json::Val* cost = mv.second->find("cost");
-            if (!cost || cost->kind != json::Val::OBJ) continue;  // free/local model
             ModelCost mc;
-            mc.in = cost_num(cost, "input");
-            mc.out = cost_num(cost, "output");
-            mc.cache_read = cost_num(cost, "cache_read");
-            mc.cache_write = cost_num(cost, "cache_write");
-            pr.by_key[mv.first].push_back({provider, mc});
+            if (cost && cost->kind == json::Val::OBJ) {
+                mc.in = cost_num(cost, "input");
+                mc.out = cost_num(cost, "output");
+                mc.cache_read = cost_num(cost, "cache_read");
+                mc.cache_write = cost_num(cost, "cache_write");
+            }
+            // ^ cost absent -> provider carries the model for free (local
+            // inference, ollama-cloud, ...). It is still recorded in the
+            // listing (key_provider) and as a $0 by_id rate, so a turn pinned
+            // to that provider prices as $0 instead of inheriting a random
+            // reseller's rate.
+            string key = mv.first;
+            size_t slash = key.rfind('/');
+            string alias = (slash == string::npos) ? key : key.substr(slash + 1);
+            if (cost && cost->kind == json::Val::OBJ)
+                pr.by_key[key].push_back({provider, mc});
+            pr.by_id[provider + "\x1f" + alias] = mc;
+            if (alias != key)
+                pr.by_id[provider + "\x1f" + key] = mc;
+            for (const string& k : {key, alias})
+                pr.key_provider[k + "\x1f" + provider] = true;
         }
     }
     return !pr.by_key.empty();
@@ -676,6 +862,10 @@ static bool rate_for_key(const Pricing& pr, const string& key, Rate& r) {
 // Resolve a log model name to rates. Order: exact key, then the listed key
 // whose trailing date stamp is stripped ("gpt-5.1-2025-11-13" -> "gpt-5.1",
 // "glm-5.2-20251113" -> "glm-5.2"), else not priced.
+// Resolve the USD-per-1M rate for a turn's model, preferring the pricing of
+// the turn's provider when known. Models.dev keys may carry a namespace
+// prefix (e.g. "z-ai/glm-5.2") that agentty drops in the logs; conversely
+// some entries exist only under the unprefixed key.
 static bool resolve_cost(const Pricing& pr, const string& model, Rate& r) {
     if (model.empty() || !pr.loaded) return false;
     if (rate_for_key(pr, model, r)) return true;
@@ -683,11 +873,52 @@ static bool resolve_cost(const Pricing& pr, const string& model, Rate& r) {
     std::smatch dm;
     if (std::regex_search(model, dm, DATE_STAMP_RE)) {
         string base = model.substr(0, model.size() - dm[0].length());
-        Rate fr;
-        if (!base.empty() && rate_for_key(pr, base, fr)) {
-            r = fr;
-            r.exact = false;   // matched via date-suffix normalisation
-            return true;
+        if (rate_for_key(pr, base, r)) { r.exact = false; return true; }
+    }
+    return false;
+}
+
+// Provider-pinned variant: restricts matching to the given models.dev
+// provider id, so a turn on https://ollama.com/v1 pays ollama-cloud prices,
+// not the cheapest reseller's. model_key_out (when non-null) receives the
+// models.dev model key that matched, for reporting.
+static bool resolve_cost_for_provider(const Pricing& pr, const string& model,
+                                      const string& pid, ModelCost& mc, string* model_key_out) {
+    auto scoped = [&](const string& key, ModelCost& out) -> bool {
+        if (pid.empty()) return false;
+        auto it = pr.by_id.find(pid + "\x1f" + key);
+        if (it != pr.by_id.end()) { out = it->second; return true; }
+        for (auto& kv : pr.by_id) {
+            size_t sep = kv.first.find('\x1f');
+            if (sep == string::npos) continue;
+            if (kv.first.substr(0, sep) != pid) continue;
+            if (iequals(kv.first.substr(sep + 1), key)) { out = kv.second; return true; }
+        }
+        return false;
+    };
+    if (scoped(model, mc)) { if (model_key_out) *model_key_out = model; return true; }
+    size_t slash = model.rfind('/');
+    if (slash != string::npos) {
+        if (scoped(model.substr(slash + 1), mc)) { if (model_key_out) *model_key_out = model.substr(slash + 1); return true; }
+    } else {
+        for (const auto& kv : pr.key_provider) {                   // try namespaced keys
+            size_t sep = kv.first.find('\x1f');
+            if (sep == string::npos || kv.first.substr(sep + 1) != pid) continue;
+            string full = kv.first.substr(0, sep);
+            size_t fs = full.rfind('/');
+            if (fs != string::npos && iequals(full.substr(fs + 1), model)) {
+                if (scoped(full, mc)) { if (model_key_out) *model_key_out = full; return true; }
+            }
+        }
+    }
+    static const std::regex DATE_STAMP_RE("-(\\d{4}-\\d{2}-\\d{2}|\\d{8,14})$");
+    std::smatch dm;
+    if (std::regex_search(model, dm, DATE_STAMP_RE)) {
+        string base = model.substr(0, model.size() - dm[0].length());
+        if (scoped(base, mc)) { if (model_key_out) *model_key_out = base; return true; }
+        if (slash != string::npos) {
+            string b = base.substr(base.rfind('/') + 1);
+            if (scoped(b, mc)) { if (model_key_out) *model_key_out = b; return true; }
         }
     }
     return false;
@@ -718,6 +949,7 @@ struct CostAcc {
     double rate_in = 0, rate_out = 0;   // USD per 1M tokens
     double input_usd = 0, output_usd = 0, total_usd = 0;
     bool exact_rate = true;
+    string disp_provider, disp_model, disp_model_key;
 };
 
 // Sort a string->count map into a vector ordered by count descending (then
@@ -781,6 +1013,12 @@ int main(int argc, char** argv) {
 
     Stats s;
     vector<string> sources;
+    // Bootstrap pass: learn the tier configuration (model -> role) from
+    // genuinely-routed turns in ALL inputs before the real parse, so that a
+    // session starting with role=none still resolves via the router state
+    // even when that routing evidence lives in a later file on the command
+    // line. The main parse then refines with per-session chronology.
+    for (size_t i = 0; i < n_inputs; i++) bootstrap_roles(s, pos[i]);
     for (size_t i = 0; i < n_inputs; i++) {
         if (!process_file(s, pos[i])) return 1;
         sources.push_back(pos[i]);
@@ -818,23 +1056,86 @@ int main(int argc, char** argv) {
     }
     map<string, CostAcc> cost_acc;
     if (pricing_enabled) {
-        // models.dev pricing is provider-agnostic; resolve once per model.
+        // Resolve each turn against its provider's own pricing when known
+        // (agentty labels custom-host/localhost providers by api URL, e.g.
+        // "https://ollama.com/v1#main" -> models.dev id "ollama-cloud"),
+        // falling back to the provider-agnostic cheapest rate. Loopback
+        // hosts are local inference: fixed at $0, not "unpriced".
         for (Turn& t : s.turn_list) {
             if (t.model.empty()) continue;
-            Rate r;
-            if (!resolve_cost(pricing, t.model, r)) continue;
-            CostAcc& a = cost_acc[t.model];
+            string pid = provider_id_for(pricing, t.provider, t.api_base);
+            string prov_disp = t.provider.empty()
+                ? (t.api_base.empty() ? "(unspecified)" : t.api_base)
+                : norm_api(t.provider);
+            if (t.provider.empty() && !pid.empty()) prov_disp = pid;
+            string mkey = t.model;
+            bool exact = true;
+            ModelCost mc;
+            bool local = is_local_api(prov_disp) || is_local_api(norm_api(t.api_base));
+            if (!local) {
+                bool pinned_priced = false, listed_at_provider = false;
+                if (!pid.empty()) {
+                    pinned_priced = resolve_cost_for_provider(pricing, t.model, pid, mc, &mkey);
+                    if (!pinned_priced) {
+                        // Provider carries the model but publishes no cost
+                        // catalog entry for it (e.g. ollama-cloud models have
+                        // cost absent): treat as provider-free at $0, not
+                        // "unpriced" and not some reseller's rate.
+                        string bare = t.model.substr(t.model.rfind('/') + 1);
+                        for (const string& k : {t.model, bare}) {
+                            if (pricing.key_provider.count(k + "\x1f" + pid))
+                                { listed_at_provider = true; break; }
+                        }
+                    }
+                }
+                if (listed_at_provider) {
+                    mc.in = mc.out = 0;   // provider-free: cost defined as $0
+                } else if (!pinned_priced) {
+                    Rate rr;
+                    if (!resolve_cost(pricing, t.model, rr)) {
+                        t.unpriced = true;
+                        continue;
+                    }
+                    mc.in = rr.in; mc.out = rr.out;
+                    exact = rr.exact;
+                }
+                if (pid.empty()) {
+                    // report which provider the rate came from, if unambiguous
+                    for (auto& kv : pricing.key_provider) {
+                        size_t sep = kv.first.find('\x1f');
+                        if (sep == string::npos) continue;
+                        if (!iequals(kv.first.substr(0, sep), mkey) && kv.first.substr(0, sep) != mkey) continue;
+                        prov_disp = "(cheapest) " + kv.first.substr(sep + 1);
+                        break;
+                    }
+                } else {
+                    prov_disp = pid;
+                }
+            }
+            if (local) prov_disp = t.model + " (local)";
+            t.cost = (double)t.prompt_tokens / 1e6 * mc.in +
+                     (double)t.completion_tokens / 1e6 * mc.out;
+            t.has_cost = true;
+            CostAcc& a = cost_acc[prov_disp + "\x1f" + t.model + "\x1f" + mkey];
             if (a.turns == 0) {
-                a.rate_in = r.in;
-                a.rate_out = r.out;
-                a.exact_rate = r.exact;
-            } else if (r.exact && (r.in != a.rate_in || r.out != a.rate_out)) {
-                a.exact_rate = false;  // mixed rates across turns/providers
+                a.rate_in = mc.in;
+                a.rate_out = mc.out;
+                a.exact_rate = exact;
+            } else if (a.rate_in != mc.in || a.rate_out != mc.out) {
+                a.exact_rate = false;  // mixed rates across turns
             }
             a.turns++;
-            a.input_usd += (double)t.prompt_tokens / 1e6 * r.in;
-            a.output_usd += (double)t.completion_tokens / 1e6 * r.out;
-            a.total_usd = a.input_usd + a.output_usd;
+            a.input_usd += (double)t.prompt_tokens / 1e6 * mc.in;
+            a.output_usd += (double)t.completion_tokens / 1e6 * mc.out;
+        }
+        for (auto& kv : cost_acc) {
+            kv.second.total_usd = kv.second.input_usd + kv.second.output_usd;
+            size_t sep1 = kv.first.find('\x1f');
+            size_t sep2 = kv.first.find('\x1f', sep1 == string::npos ? sep1 : sep1 + 1);
+            kv.second.disp_provider = kv.first.substr(0, sep1);
+            kv.second.disp_model = kv.first.substr(sep1 + 1, sep2 - sep1 - 1);
+            kv.second.disp_model_key = sep2 == string::npos ? kv.second.disp_model
+                                     : kv.first.substr(sep2 + 1);
         }
     }
 
@@ -861,15 +1162,6 @@ int main(int argc, char** argv) {
     }
     std::ostringstream o;
     o << "# agentty — Session Statistics Report\n\n";
-    o << "**Source";
-    if (sources.size() > 1) o << "s";
-    o << ":** ";
-    for (size_t i = 0; i < sources.size(); i++) {
-        if (i) o << ", ";
-        o << "`" << sources[i] << "`";
-    }
-    o << "\n\n";
-    o << "**Generated:** " << s.last_ts << "\n\n";
     if (!no_cost) {
         o << "**Pricing source:** [models.dev](https://models.dev) (agentty cache: `" << pricing_path << "`, USD per 1M tokens)\n\n";
     }
@@ -944,10 +1236,65 @@ int main(int argc, char** argv) {
     // 3. Smart-mode routing
     o << "## 3. Smart-mode routing\n\n";
     const long long total_turns_n = (long long)s.turn_list.size();
-    o << "### Role\n\n| Role | Turns | % of total |\n|---|---|---|\n";
-    for (auto& kv : sorted_pairs(s.role_count))
-        o << "| " << kv.first << " | " << kv.second << " | "
-          << (total_turns_n ? pct_fmt(100.0 * (double)kv.second / (double)total_turns_n) : "-") << " |\n";
+    // `route.turn`'s role= is the router's decision for that turn; 'none'
+    // means the router did not re-route (the turn kept the active model),
+    // not that it ran outside the tiers — every route.turn line carries a
+    // model= that reveals which tier executed it. Resolve 'none' via a
+    // model→role map learned from genuinely-routed turns (recurring 'none's
+    // fall back to the previous resolved role).
+    {
+        map<string, long long> role_res;
+        map<string, long long> role_res_prompt, role_res_compl;
+        vector<string> map_notes;
+        long long src_model = 0, src_prev = 0, src_unres = 0;
+        long long tot_prompt = 0, tot_compl = 0;
+        for (Turn& t : s.turn_list) {
+            const string r = t.role_inferred.empty() ? "(unknown)" : t.role_inferred;
+            role_res[r]++;
+            role_res_prompt[r] += t.prompt_tokens;
+            role_res_compl[r] += t.completion_tokens;
+            tot_prompt += t.prompt_tokens;
+            tot_compl += t.completion_tokens;
+            if (t.role_source == 1) src_model++;
+            else if (t.role_source == 2) src_prev++;
+            else if (t.role_inferred.empty() || t.role_inferred == "none") src_unres++;
+        }
+        for (auto& kv : s.role_model_map)
+            map_notes.push_back("`" + kv.first + "` → " + kv.second);
+        o << "### Role\n\n"
+          << "Turns the router logged as `role=none` are attributed to the tier whose\n"
+          << "model actually executed them, via the router map learned from routed turns\n"
+          << "(";
+        for (size_t i = 0; i < map_notes.size(); i++)
+            o << (i ? ", " : "") << map_notes[i];
+        o << "); recurring `none`s fall back to the previous resolved role.\n\n";
+        o << "| Role | Turns | % of total |\n|---|---|---|\n";
+        for (auto& kv : sorted_pairs(role_res))
+            o << "| " << kv.first << " | " << kv.second << " | "
+              << (total_turns_n ? pct_fmt(100.0 * (double)kv.second / (double)total_turns_n) : "-") << " |\n";
+        // Turn counts are a skewed proxy: one turn re-sends the whole
+        // conversation context, so token volume is the fair comparison with
+        // provider-side (e.g. ollama.com) usage reports.
+        vector<string> tok_keys;
+        for (auto& kv : role_res_prompt) tok_keys.push_back(kv.first);
+        std::sort(tok_keys.begin(), tok_keys.end(), [&](const string& a, const string& b) {
+            long long ta = role_res_prompt[a] + role_res_compl[a], tb = role_res_prompt[b] + role_res_compl[b];
+            return ta != tb ? ta > tb : a < b;
+        });
+        o << "\n**Token share by tier:**\n\n"
+          << "| Role | Prompt tok | Completion tok | Total tok | % of tokens |\n|---|---|---|---|---|\n";
+        for (auto& k : tok_keys) {
+            long long tot = role_res_prompt[k] + role_res_compl[k];
+            o << "| " << k << " | " << human_tokens(role_res_prompt[k]) << " | "
+              << human_tokens(role_res_compl[k]) << " | " << human_tokens(tot) << " | "
+              << (tot_prompt + tot_compl ? pct_fmt(100.0 * (double)tot / (double)(tot_prompt + tot_compl)) : "-") << " |\n";
+        }
+        if (src_model + src_prev > 0 || src_unres > 0)
+            o << "\n_" << src_model << " turn(s) resolved via model→role map, "
+              << src_prev << " via previous role"
+              << (src_unres ? ", " + std::to_string(src_unres) + " left unresolved" : "")
+              << "._\n";
+    }
     o << "\n### Complexity\n\n| Complexity | Turns | % of total |\n|---|---|---|\n";
     for (auto& kv : sorted_pairs(s.complexity_count))
         o << "| " << kv.first << " | " << kv.second << " | "
@@ -1000,8 +1347,8 @@ int main(int argc, char** argv) {
     } else if (cost_acc.empty()) {
         o << "*No priced models: none of the models in the logs could be matched to a models.dev entry.*\n\n";
     } else {
-        o << "| Model | $/1M in | Input cost | $/1M out | Output cost | Turns | Total cost |\n";
-        o << "|---|---|---|---|---|---|---|\n";
+        o << "| Provider | Model | $/1M in | Input cost | $/1M out | Output cost | Turns | Total cost |\n";
+        o << "|---|---|---|---|---|---|---|---|\n";
         vector<const std::pair<const string, CostAcc>*> cost_rows;
         for (const auto& kv : cost_acc) cost_rows.push_back(&kv);
         std::stable_sort(cost_rows.begin(), cost_rows.end(),
@@ -1013,23 +1360,26 @@ int main(int argc, char** argv) {
                          });
         double grand_total = 0;
         for (const auto* kv : cost_rows) {
-            const string& name = kv->first;
             const CostAcc& a = kv->second;
             grand_total += a.total_usd;
-            o << "| " << name
-              << " | " << usd_fmt(a.rate_in)
+            string rate_in = usd_fmt(a.rate_in), rate_out = usd_fmt(a.rate_out);
+            if (!a.exact_rate) { rate_in += "\\*"; rate_out += "\\*"; }
+            o << "| " << a.disp_provider
+              << " | " << a.disp_model
+              << " | " << rate_in
               << " | " << usd_fmt(a.input_usd)
-              << " | " << usd_fmt(a.rate_out)
+              << " | " << rate_out
               << " | " << usd_fmt(a.output_usd)
               << " | " << a.turns
-              << " | " << usd_fmt(a.total_usd)
-              << (a.exact_rate ? "" : " (approx.)")
-              << " |\n";
+              << " | " << usd_fmt(a.total_usd) << " |\n";
         }
-        o << "| | | | | | | **" << usd_fmt(grand_total) << "** |\n\n";
+        o << "| **Total** | | | | | | | **" << usd_fmt(grand_total) << "** |\n\n";
         long long unpriced_turns = 0;
         for (auto& kv : s.models) {
-            if (cost_acc.count(kv.first)) continue;
+            bool any_priced = false;
+            for (auto& c : cost_acc)
+                if (c.second.disp_model == kv.first) { any_priced = true; break; }
+            if (any_priced) continue;
             unpriced_turns += kv.second.turns;
             o << "*No pricing data for model `" << kv.first << "` (" << kv.second.turns
               << " turns, " << human_tokens(kv.second.prompt_tokens + kv.second.completion_tokens) << " tokens) — excluded from cost totals.*\n";
@@ -1131,11 +1481,10 @@ int main(int argc, char** argv) {
         for (const Turn* t : ordered) {
             long long dur = (t->has_end && t->wall_end_ms >= t->wall_start_ms) ? (t->wall_end_ms - t->wall_start_ms) : 0;
             string turn_cost = "-";
-            if (pricing_enabled && !t->model.empty()) {
-                Rate r;
-                if (resolve_cost(pricing, t->model, r))
-                    turn_cost = usd_fmt((double)t->prompt_tokens / 1e6 * r.in + (double)t->completion_tokens / 1e6 * r.out);
-            }
+            if (pricing_enabled && t->has_cost)
+                turn_cost = usd_fmt(t->cost);
+            else if (pricing_enabled && t->unpriced)
+                turn_cost = "n/a";
             o << "| " << i++
               << " | " << (t->model.empty() ? "-" : t->model)
               << " | " << (t->complexity.empty() ? "-" : t->complexity)

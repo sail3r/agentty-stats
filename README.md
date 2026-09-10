@@ -44,12 +44,35 @@ non-zero. A malformed or empty pricing file is treated the same way. To
 produce a report without the cost section entirely, pass `--no-cost`.
 
 Estimates are computed as `prompt_tokens/1e6 × $/1M-in +
-completion_tokens/1e6 × $/1M-out` per turn. Pricing is provider-agnostic:
-when several providers list the same model key, the cheapest metered
-(non-zero) rate wins. Cache-read/cache-write tokens are not logged by
-agentty and are therefore not part of the estimate; date-stamped model ids
-(e.g. `gpt-5.1-2025-11-13`) are matched to the base model and marked
-"(approx.)" in the report.
+completion_tokens/1e6 × $/1M-out` per turn. Cache-read/cache-write tokens
+are not logged by agentty and are therefore not part of the estimate;
+date-stamped model ids (e.g. `gpt-5.1-2025-11-13`) are matched to the base
+model and marked "(approx.)" in the report.
+
+### Provider attribution
+
+The **Provider** column pins each model's cost to the provider that actually
+served it. `dispatch.turn` rarely carries a `provider=` field, and
+`provider.select` events only appear on account/model switches, so the
+per-request **`openai.request` endpoint URL** (e.g.
+`https://ollama.com:443/v1/chat/completions` → `https://ollama.com/v1`) is
+the ground truth, with the last `provider.select` label as fallback. A label
+is matched against the models.dev cache in this order:
+
+1. exact **provider id** (`ollama-cloud`),
+2. **display name**, case-insensitive (`"Kimi"` → `kimi`),
+3. the provider's **`api` URL**, after stripping agentty's `#account`
+   disambiguator (everything from `#` to string end), collapsing `localhost`
+   to `127.0.0.1`, and dropping `:443`/`:80` ports — this is how custom-host
+   and localhost providers are labelled (`http://127.0.0.1:8080/v1#main` →
+   `http://127.0.0.1:8080/v1`).
+
+A turn whose provider is resolved is priced against **that provider's own
+catalog**: if the provider lists the model without a `cost` entry
+(e.g. ollama-cloud, self-hosted endpoints), it prices at **$0** — never at a
+reseller's rate. Only when the provider can't be identified does the global
+cheapest models.dev rate apply, labelled `(cheapest) <provider>`. Loopback
+endpoints are fixed at $0 (inference on the user's machine).
 
 ## Setup
 
@@ -107,6 +130,10 @@ A **turn** is opened by each `dispatch.turn` event. The immediately preceding
 `dispatch.turn`. `tool.exec` uses independent session ids and is aggregated
 globally.
 
+`route.turn`'s `role=` may be `none`: the router did not re-route that turn
+(no routing decision emitted), not that the turn ran outside the configured
+tiers — the same line's `model=` still shows which model executed it.
+
 Two caveats the tool accounts for:
 
 - **Clock resets** — the relative `+<rel-ms>ms` field restarts per file, so
@@ -128,9 +155,9 @@ tool extracts for per-turn and per-model token accounting.
 
 1. **Overview** — turns, time span, models, total tokens, wire volume, tool calls, persistence, models loaded (per file), errors.
 2. **Log volume** — counts by level, component, and event.
-3. **Smart-mode routing** — role, complexity, orchestration flags.
+3. **Smart-mode routing** — role, complexity, orchestration flags. The role table resolves `role=none` turns (router kept the active model, not unrouted) to the tier whose model actually executed them, via a model → role map learned from routed turns across all input files, falling back to the previous resolved role for reoccurring `none`s. Includes **token share by tier** — turn counts skew the picture (each turn re-sends the full conversation context), while token volume is comparable with provider-side usage reports (e.g. ollama.com).
 4. **Per-model usage** — turns, prompt/completion tokens, request/chunk bytes, chunk counts, retried turns, errors (sorted by turns, descending).
-4b. **Cost (USD)** — per-model input/output cost, $/1M rates from models.dev, grand total; per-turn cost column in §7. Sorted by total cost, descending. Pass `--no-cost` to skip.
+4b. **Cost (USD)** — per-model input/output cost with a **Provider** column and $/1M rates from models.dev, plus a grand total; per-turn cost column in §7. Sorted by total cost, descending. Pass `--no-cost` to skip.
 5. **Tool usage** — calls, total/avg/max latency, ok/err (sorted by calls, descending).
 6. **Wire / streaming** — stop reasons, HTTP status, hosts, providers.
 6b. **Failures & retries** — retried turns, HTTP-error turns (by status), `stream.retry` attempts, `stream.error` classes, connection failures, samples.
