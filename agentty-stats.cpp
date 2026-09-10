@@ -796,11 +796,11 @@ int main(int argc, char** argv) {
                 a.rate_in = r.in;
                 a.rate_out = r.out;
                 a.exact_rate = r.exact;
-                // Always report the models.dev provider whose rates were
-                // used; the log-side provider id (e.g. an agentty endpoint
-                // like "https://ollama.com/v1#main") is not a models.dev key
-                // and would misattribute the price.
-                a.provider = r.provider;
+                // Show the provider actually used by the turns from the log
+                // (same values as the "## Providers" table). Fall back to the
+                // models.dev provider whose rates were picked only when the
+                // log turns carry no provider.
+                a.provider = t.provider.empty() ? r.provider : t.provider;
             } else if (r.exact && (r.in != a.rate_in || r.out != a.rate_out)) {
                 a.exact_rate = false;  // mixed rates across turns/providers
             }
