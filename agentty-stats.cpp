@@ -1416,7 +1416,6 @@ int main(int argc, char **argv) {
   }
   std::ostringstream o;
   o << "# agentty — Session Statistics Report\n\n";
-  o << "---\n\n";
 
   // 1. Overview
   o << "## 1. Overview\n\n";
