@@ -87,16 +87,16 @@
 
 *Prices from [models.dev](https://models.dev), loaded from `tests/fixture-modelsdev.json`; all amounts are United States Dollars (USD). Cost = prompt/1M × input-rate + completion/1M × output-rate.*
 
-| Model | Provider | $/1M in | $/1M out | Turns | Input cost | Output cost | Total cost | Source |
-|---|---|---|---|---|---|---|---|---|
-| claude-sonnet-4-6 | anthropic | 3 | 15 | 1 | $3.0000 | $1.5000 | $4.5000 | models.dev (anthropic) |
-| glm-5.2 | z-ai | 0.7524 | 4.275 | 1 | $0.3762 | $0.2138 | $0.5899 | models.dev (z-ai) |
-| gpt-5.1-2025-11-13 | openai | 1.25 | 10 | 1 | $0.1250 | $0.1000 | $0.2250 (approx.) | models.dev (openai) |
-| **Total** | | | | | $3.5012 | $1.8138 | **$5.3149** | |
+| Model | Provider | $/1M in | $/1M out | Turns | Input cost | Output cost | Total cost |
+|---|---|---|---|---|---|---|---|
+| claude-sonnet-4-6 | anthropic | 3 | 15 | 1 | $3.0000 | $1.5000 | $4.5000 |
+| glm-5.2 | z-ai | 0.7524 | 4.275 | 1 | $0.3762 | $0.2138 | $0.5899 |
+| gpt-5.1-2025-11-13 | openai | 1.25 | 10 | 1 | $0.1250 | $0.1000 | $0.2250 (approx.) |
+| **Total** | | | | | $3.5012 | $1.8138 | **$5.3149** |
 
 *No pricing data for model `mystery-model-x` (1 turns, 1.1k tokens) — excluded from cost totals.*
 
-*Note: every rate above comes from [models.dev](https://models.dev) (agentty's pricing cache) unless a provider's public API exposes a token price directly — none currently does in these logs. Endpoint URLs from the log (e.g. `https://ollama.com/v1#main`) are resolved to the models.dev provider advertising the same API base; a model listed there without a published cost is shown as `(plan)` at $0.00. Estimates use input/output token counts from the logs; cache-read/cache-write tokens are not logged and are therefore not reflected in these figures.*
+*Note: estimates use input/output token counts from the logs; cache-read/cache-write tokens are not logged and are therefore not reflected in these figures.*
 
 ## 5. Tool usage
 

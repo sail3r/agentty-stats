@@ -130,7 +130,7 @@ tool extracts for per-turn and per-model token accounting.
 2. **Log volume** — counts by level, component, and event.
 3. **Smart-mode routing** — role, complexity, orchestration flags.
 4. **Per-model usage** — turns, prompt/completion tokens, request/chunk bytes, chunk counts, retried turns, errors (sorted by turns, descending).
-4b. **Cost (USD)** — per-model input/output cost, $/1M rates from models.dev, grand total; per-turn cost column in §7. Sorted by total cost, descending. Rates are only ever taken from a truthful source: a token price exposed by the provider's own API (none currently do) or models.dev otherwise — the per-row **Source** column states which one, and how endpoint URLs in the log (e.g. `https://ollama.com/v1#main`) resolved to a models.dev provider. A model listed by its provider with no published price is shown as `(plan)` at $0.00. Pass `--no-cost` to skip.
+4b. **Cost (USD)** — per-model input/output cost, $/1M rates from models.dev, grand total; per-turn cost column in §7. Sorted by total cost, descending. Pass `--no-cost` to skip.
 5. **Tool usage** — calls, total/avg/max latency, ok/err (sorted by calls, descending).
 6. **Wire / streaming** — stop reasons, HTTP status, hosts, providers.
 6b. **Failures & retries** — retried turns, HTTP-error turns (by status), `stream.retry` attempts, `stream.error` classes, connection failures, samples.

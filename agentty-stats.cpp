@@ -432,14 +432,6 @@ struct Pricing {
     // "claude-sonnet-4-6" or "z-ai/glm-5.2") -> (provider, costs). A key may
     // exist under several providers (resellers) with different prices.
     map<string, vector<std::pair<string, ModelCost>>> by_key;
-    // provider -> model keys the provider lists, regardless of cost. Used for
-    // plan-detection: an entry here with no by_key entry means the provider
-    // serves the model without a published price (plan/subscription).
-    map<string, vector<string>> by_provider;
-    // provider -> API base URL from the provider object's "api" field
-    // (e.g. ollama-cloud -> "https://ollama.com/v1"). Used to match log-side
-    // endpoint ids like "https://ollama.com/v1#main" to a models.dev provider.
-    map<string, string> api;
     string path;                        // file the pricing was loaded from
     bool loaded = false;
 };
@@ -584,14 +576,11 @@ static bool pricing_from_json(const string& buf, Pricing& pr) {
     if (root->kind != json::Val::OBJ) return false;
     for (const auto& pv : root->obj) {
         const string& provider = pv.first;
-        const json::Val* api = pv.second->find("api");
-        if (api && api->kind == json::Val::STR) pr.api[provider] = api->str;
         const json::Val* models = pv.second->find("models");
         if (!models || models->kind != json::Val::OBJ) continue;
         for (const auto& mv : models->obj) {
-            pr.by_provider[provider].push_back(mv.first);
             const json::Val* cost = mv.second->find("cost");
-            if (!cost || cost->kind != json::Val::OBJ) continue;  // free/plan/local model
+            if (!cost || cost->kind != json::Val::OBJ) continue;  // free/local model
             ModelCost mc;
             mc.in = cost_num(cost, "input");
             mc.out = cost_num(cost, "output");
@@ -600,7 +589,7 @@ static bool pricing_from_json(const string& buf, Pricing& pr) {
             pr.by_key[mv.first].push_back({provider, mc});
         }
     }
-    return !pr.by_key.empty() || !pr.by_provider.empty();
+    return !pr.by_key.empty();
 }
 
 // Load the pricing file. Returns false if the path was explicitly given
@@ -630,113 +619,47 @@ static bool load_pricing(const string& path, Pricing& pr, bool& missing_default_
 struct Rate {          // resolved USD-per-1M-token rates
     double in = 0, out = 0;
     bool exact = true; // false when matched by fuzzy date-prefix
-    bool plan = false; // provider known to serve the model with no published price (plan/subscription)
-    string provider;   // models.dev provider whose entry was used
-    string source;     // provenance label, e.g. "models.dev (ollama-cloud)"
+    string provider;   // models.dev provider whose rates were picked
 };
 
-// True when the string looks like a URL/endpoint id rather than a models.dev
-// provider id (log providers are agentty endpoint ids, e.g.
-// "https://ollama.com/v1#main" or "ollama.com/v1/chat/completions").
-static bool looks_like_url(const string& s) {
-    return s.find("://") != string::npos || s.find('/') != string::npos;
-}
-
-// Map a log-side provider value to a models.dev provider id: exact id first,
-// then match the URL base against the providers' "api" fields. Longest api
-// base wins so a more specific path beats a shorter shared host.
-static string match_provider(const Pricing& pr, const string& provider) {
-    if (provider.empty()) return "";
-    if (!looks_like_url(provider)) return provider;  // already a provider id (or name)
-    string base = provider;
-    size_t hash = base.find('#');
-    if (hash != string::npos) base.resize(hash);
-    const string* best = nullptr;
-    size_t best_len = 0;
-    for (const auto& kv : pr.api)
-        if (kv.second.size() > best_len && base.compare(0, kv.second.size(), kv.second) == 0) {
-            best = &kv.first;
-            best_len = kv.second.size();
-        }
-    return best ? *best : "";
-}
-
-// Plan detection under a specific provider: model key is listed but has no
-// published cost object -> plan/subscription-served, honestly $0.
-static bool plan_for_key(const Pricing& pr, const string& key, const string& prov, Rate& r) {
-    if (prov.empty()) return false;
-    auto it = pr.by_provider.find(prov);
-    if (it == pr.by_provider.end()) return false;
-    for (const string& k : it->second)
-        if (k == key) {
-            r.in = r.out = 0;
-            r.plan = true;
-            r.provider = prov;
-            r.source = "models.dev (" + prov + ")";
-            return true;
-        }
-    return false;
-}
-
-// Exact-key cost resolution for one candidate key against the pricing table.
-// Truthfulness order: the turn's provider (matched by id or API URL) always
-// wins — including a plan/uncosted entry there, which is reported as $0
-// rather than silently re-priced from a reseller. Only when the provider is
-// unknown do we fall back to the cheapest metered (non-zero) rate, and the
-// Source column says which entry the number actually came from.
-static bool cost_for_key(const Pricing& pr, const string& key, const string& provider, Rate& r) {
-    string prov = match_provider(pr, provider);
+// Exact-key resolution for one candidate key against the pricing table.
+// When several providers list the same model key (resellers), prefer the
+// turn's provider (exact models.dev id); otherwise fall back
+// deterministically to the cheapest metered (non-zero) input rate.
+static bool rate_for_key(const Pricing& pr, const string& key, const string& provider, Rate& r) {
     auto it = pr.by_key.find(key);
-    if (it != pr.by_key.end()) {
-        const vector<std::pair<string, ModelCost>>& cands = it->second;
-        if (!prov.empty()) {
-            // When the turn's provider is known, its own listing decides:
-            // costed entry -> use it; listed but uncosted -> plan ($0).
-            // Never substitute another provider's price for it.
-            for (const auto& cand : cands)
-                if (cand.first == prov) {
-                    r.in = cand.second.in;
-                    r.out = cand.second.out;
-                    r.provider = prov;
-                    r.source = "models.dev (" + prov + ")";
-                    r.exact = true;
-                    return true;
-                }
-            if (plan_for_key(pr, key, prov, r)) return true;
-        }
-        // Provider unknown (or doesn't list this model): cheapest metered
-        // (non-zero) rate; costless plan entries never fill in here.
+    if (it == pr.by_key.end()) return false;
+    const vector<std::pair<string, ModelCost>>& cands = it->second;
+    const std::pair<string, ModelCost>* pick = &cands[0];
+    bool provider_hit = false;
+    for (const auto& cand : cands)
+        if (!provider.empty() && cand.first == provider) { pick = &cand; provider_hit = true; break; }
+    if (!provider_hit && cands.size() > 1) {
         const std::pair<string, ModelCost>* best = nullptr;
         for (const auto& cand : cands)
             if (cand.second.in > 0 || cand.second.out > 0)
                 if (!best || cand.second.in < best->second.in) best = &cand;
-        if (best) {
-            r.in = best->second.in;
-            r.out = best->second.out;
-            r.provider = best->first;
-            r.source = "models.dev (" + best->first + ")";
-            r.exact = true;
-            return true;
-        }
-        // All-costless key belongs to some other provider; not priceable.
-        return false;
+        if (best) pick = best;
     }
-    return plan_for_key(pr, key, prov, r);
+    r.in = pick->second.in;
+    r.out = pick->second.out;
+    r.provider = pick->first;
+    r.exact = true;
+    return true;
 }
 
-// Resolve a log model name to rates. Order: exact key (matched provider,
-// incl. plan entries), then the listed key whose trailing date stamp is
-// stripped ("gpt-5.1-2025-11-13" -> "gpt-5.1", "glm-5.2-20251113" ->
-// "glm-5.2"), else not priced.
+// Resolve a log model name to rates. Order: exact key, then the listed key
+// whose trailing date stamp is stripped ("gpt-5.1-2025-11-13" -> "gpt-5.1",
+// "glm-5.2-20251113" -> "glm-5.2"), else not priced.
 static bool resolve_cost(const Pricing& pr, const string& model, const string& provider, Rate& r) {
     if (model.empty() || !pr.loaded) return false;
-    if (cost_for_key(pr, model, provider, r)) return true;
+    if (rate_for_key(pr, model, provider, r)) return true;
     static const std::regex DATE_STAMP_RE("-(\\d{4}-\\d{2}-\\d{2}|\\d{8,14})$");
     std::smatch dm;
     if (std::regex_search(model, dm, DATE_STAMP_RE)) {
         string base = model.substr(0, model.size() - dm[0].length());
         Rate fr;
-        if (!base.empty() && cost_for_key(pr, base, provider, fr)) {
+        if (!base.empty() && rate_for_key(pr, base, provider, fr)) {
             r = fr;
             r.exact = false;   // matched via date-suffix normalisation
             return true;
@@ -761,9 +684,7 @@ struct CostAcc {
     double rate_in = 0, rate_out = 0;   // USD per 1M tokens
     double input_usd = 0, output_usd = 0, total_usd = 0;
     bool exact_rate = true;
-    bool plan = false;
     string provider;
-    string source;
 };
 
 // Sort a string->count map into a vector ordered by count descending (then
@@ -880,11 +801,8 @@ int main(int argc, char** argv) {
                 // like "https://ollama.com/v1#main") is not a models.dev key
                 // and would misattribute the price.
                 a.provider = r.provider;
-                a.plan = r.plan;
-                a.source = r.source;
             } else if (r.exact && (r.in != a.rate_in || r.out != a.rate_out)) {
                 a.exact_rate = false;  // mixed rates across turns/providers
-                a.plan = false;
             }
             a.turns++;
             a.input_usd += (double)t.prompt_tokens / 1e6 * r.in;
@@ -1034,8 +952,8 @@ int main(int argc, char** argv) {
     } else if (cost_acc.empty()) {
         o << "*No priced models: none of the models in the logs could be matched to a models.dev entry.*\n\n";
     } else {
-        o << "| Model | Provider | $/1M in | $/1M out | Turns | Input cost | Output cost | Total cost | Source |\n";
-        o << "|---|---|---|---|---|---|---|---|---|\n";
+        o << "| Model | Provider | $/1M in | $/1M out | Turns | Input cost | Output cost | Total cost |\n";
+        o << "|---|---|---|---|---|---|---|---|\n";
         vector<const std::pair<const string, CostAcc>*> cost_rows;
         for (const auto& kv : cost_acc) cost_rows.push_back(&kv);
         std::stable_sort(cost_rows.begin(), cost_rows.end(),
@@ -1053,7 +971,7 @@ int main(int argc, char** argv) {
             grand_out += a.output_usd;
             grand_total += a.total_usd;
             o << "| " << name
-              << " | " << (a.provider.empty() ? "-" : a.provider) << (a.plan ? " (plan)" : "")
+              << " | " << (a.provider.empty() ? "-" : a.provider)
               << " | " << a.rate_in
               << " | " << a.rate_out
               << " | " << a.turns
@@ -1061,10 +979,9 @@ int main(int argc, char** argv) {
               << " | " << usd_fmt(a.output_usd)
               << " | " << usd_fmt(a.total_usd)
               << (a.exact_rate ? "" : " (approx.)")
-              << " | " << (a.source.empty() ? "-" : a.source)
               << " |\n";
         }
-        o << "| **Total** | | | | | " << usd_fmt(grand_in) << " | " << usd_fmt(grand_out) << " | **" << usd_fmt(grand_total) << "** | |\n\n";
+        o << "| **Total** | | | | | " << usd_fmt(grand_in) << " | " << usd_fmt(grand_out) << " | **" << usd_fmt(grand_total) << "** |\n\n";
         long long unpriced_turns = 0;
         for (auto& kv : s.models) {
             if (cost_acc.count(kv.first)) continue;
@@ -1073,9 +990,7 @@ int main(int argc, char** argv) {
               << " turns, " << human_tokens(kv.second.prompt_tokens + kv.second.completion_tokens) << " tokens) — excluded from cost totals.*\n";
         }
         if (unpriced_turns) o << "\n";
-        o << "*Note: every rate above comes from [models.dev](https://models.dev) (agentty's pricing cache) unless a provider's public API exposes a token price directly — none currently does in these logs. "
-             "Endpoint URLs from the log (e.g. `https://ollama.com/v1#main`) are resolved to the models.dev provider advertising the same API base; a model listed there without a published cost is shown as `(plan)` at $0.00. "
-             "Estimates use input/output token counts from the logs; cache-read/cache-write tokens are not logged and are therefore not reflected in these figures.*\n\n";
+        o << "*Note: estimates use input/output token counts from the logs; cache-read/cache-write tokens are not logged and are therefore not reflected in these figures.*\n\n";
     }
 
     // 5. Tool usage
