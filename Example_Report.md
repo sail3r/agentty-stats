@@ -1,7 +1,5 @@
 # agentty — Session Statistics Report
 
-**Pricing source:** [models.dev](https://models.dev) (agentty cache: `tests/modelsdev-real.json`, USD per 1M tokens)
-
 ---
 
 ## 1. Overview
@@ -83,10 +81,6 @@
 
 ### Role
 
-Turns the router logged as `role=none` are attributed to the tier whose
-model actually executed them, via the router map learned from routed turns
-(`glm-5.3` → implementation, `glm-5.3-flash` → utility, `kimi-k3` → strategic); recurring `none`s fall back to the previous resolved role.
-
 | Role | Turns | % of total |
 |---|---|---|
 | strategic | 172 | 38.1 |
@@ -129,7 +123,7 @@ _134 turn(s) resolved via model→role map, 1 via previous role._
 
 ## 4b. Cost (USD)
 
-*Prices from [models.dev](https://models.dev), loaded from `tests/modelsdev-real.json`; all amounts are United States Dollars (USD). Cost = prompt/1M × input-rate + completion/1M × output-rate.*
+*Prices from [models.dev](https://models.dev), loaded from `~/.agentty/cache/modelsdev.json`; all amounts are United States Dollars (USD). Cost = prompt/1M × input-rate + completion/1M × output-rate.*
 
 | Provider | Model | $/1M in | Input cost | $/1M out | Output cost | Turns | Total cost |
 |---|---|---|---|---|---|---|---|
