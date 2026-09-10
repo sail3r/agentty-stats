@@ -60,13 +60,13 @@
 
 ### Role
 
-| Role | Turns |
-|---|---|
+| Role | Turns | % of total |
+|---|---|---|
 
 ### Complexity
 
-| Complexity | Turns |
-|---|---|
+| Complexity | Turns | % of total |
+|---|---|---|
 
 ### Orchestration flags
 

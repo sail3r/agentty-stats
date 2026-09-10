@@ -668,6 +668,15 @@ static bool resolve_cost(const Pricing& pr, const string& model, const string& p
     return false;
 }
 
+// Format a percentage share: one decimal (e.g. "58.9"), no % sign — the
+// column header already says %.
+static string pct_fmt(double v) {
+    std::ostringstream os;
+    os.imbue(std::locale::classic());
+    os << std::fixed << std::setprecision(1) << v;
+    return os.str();
+}
+
 // Format a USD amount: enough precision for sub-cent values, trimmed for big ones.
 static string usd_fmt(double v) {
     char b[64];
@@ -900,10 +909,15 @@ int main(int argc, char** argv) {
 
     // 3. Smart-mode routing
     o << "## 3. Smart-mode routing\n\n";
-    o << "### Role\n\n| Role | Turns |\n|---|---|\n";
-    for (auto& kv : sorted_pairs(s.role_count)) o << "| " << kv.first << " | " << kv.second << " |\n";
-    o << "\n### Complexity\n\n| Complexity | Turns |\n|---|---|\n";
-    for (auto& kv : sorted_pairs(s.complexity_count)) o << "| " << kv.first << " | " << kv.second << " |\n";
+    const long long total_turns_n = (long long)s.turn_list.size();
+    o << "### Role\n\n| Role | Turns | % of total |\n|---|---|---|\n";
+    for (auto& kv : sorted_pairs(s.role_count))
+        o << "| " << kv.first << " | " << kv.second << " | "
+          << (total_turns_n ? pct_fmt(100.0 * (double)kv.second / (double)total_turns_n) : "-") << " |\n";
+    o << "\n### Complexity\n\n| Complexity | Turns | % of total |\n|---|---|---|\n";
+    for (auto& kv : sorted_pairs(s.complexity_count))
+        o << "| " << kv.first << " | " << kv.second << " | "
+          << (total_turns_n ? pct_fmt(100.0 * (double)kv.second / (double)total_turns_n) : "-") << " |\n";
     o << "\n### Orchestration flags\n\n";
     {
         long long orch=0, sub=0, comp=0;
