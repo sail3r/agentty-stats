@@ -29,6 +29,7 @@
 #include <sstream>
 #include <memory>
 #include <cctype>
+#include <sys/stat.h>
 
 using std::string;
 using std::vector;
@@ -153,6 +154,12 @@ struct ModelStat {
 // Aggregation state (shared across all input files)
 // ---------------------------------------------------------------------------
 
+struct SourceFile {
+    string path;
+    long long bytes = 0;
+    long long models_loaded = -1;   // -1 = no models.loaded event seen in this file
+};
+
 struct Stats {
     map<string, ToolStat> tools;
     map<string, ModelStat> models;
@@ -172,6 +179,7 @@ struct Stats {
     long long total_prompt = 0, total_completion = 0;
     long long thread_saves = 0, thread_messages = 0;
     map<string, long long> model_loaded_by_file;  // file -> count (last wins per file)
+    vector<SourceFile> source_files;              // every input file, in argument order
     map<string, long long> http_error_status;     // e.g. "429" -> count
     map<long long, long long> retry_attempts;     // attempt number -> count
     map<string, long long> stream_error_class;    // class -> count
@@ -306,7 +314,10 @@ static void process_event(Stats& s) {
     }
     else if (ev == "models.loaded") {
         // keep per-source so multiple files don't overwrite each other
-        s.model_loaded_by_file[s.cur_file] = field_num(pl, "count");
+        long long cnt = field_num(pl, "count");
+        s.model_loaded_by_file[s.cur_file] = cnt;
+        for (auto& sf : s.source_files)
+            if (sf.path == s.cur_file) { sf.models_loaded = cnt; break; }
     }
     else if (ev == "stream.retry") {
         s.retry_attempts[field_num(pl, "attempt")]++;
@@ -359,6 +370,18 @@ static bool process_file(Stats& s, const char* path) {
     FILE* f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "error: cannot open %s\n", path); return false; }
     s.cur_file = path;
+
+    // Register every input file with its byte size so it appears in the report
+    // even when it emits no parsable events (e.g. a session continuation that
+    // starts mid-stream and never fires models.loaded).
+    SourceFile sf;
+    sf.path = path;
+    {
+        struct stat st;
+        if (fstat(fileno(f), &st) == 0) sf.bytes = (long long)st.st_size;
+    }
+    s.source_files.push_back(sf);
+
     // File boundary: nothing from a previous file may bleed into this one.
     s.have_cur = false;
     s.cur_turn = nullptr;
@@ -876,18 +899,34 @@ int main(int argc, char** argv) {
     o << "| Tool calls | " << ([] (const map<string,ToolStat>& t){ long long n=0; for(auto&kv:t)n+=kv.second.calls; return n; })(s.tools) << " |\n";
     o << "| Thread saves | " << s.thread_saves << " (" << s.thread_messages << " messages) |\n";
     o << "| Models loaded | ";
-    if (s.model_loaded_by_file.empty()) o << "0";
+    if (s.source_files.empty()) o << "0";
     else {
         bool first = true;
-        for (auto& kv : s.model_loaded_by_file) {
+        for (auto& sf : s.source_files) {
             if (!first) o << "; ";
             first = false;
             // basename for readability
-            string base = kv.first;
+            string base = sf.path;
             size_t slash = base.find_last_of('/');
             if (slash != string::npos) base = base.substr(slash + 1);
-            o << base << "=" << kv.second;
+            o << base << "=";
+            if (sf.models_loaded >= 0) o << sf.models_loaded;
+            else o << "n/a";   // session continuation: no models.loaded event in this file
         }
+    }
+    o << " |\n";
+    o << "| Source files | " << s.source_files.size() << " (";
+    {
+        long long tot = 0;
+        for (auto& sf : s.source_files) tot += sf.bytes;
+        o << human_bytes(tot);
+    }
+    o << " total)\n";
+    for (auto& sf : s.source_files) {
+        string base = sf.path;
+        size_t slash = base.find_last_of('/');
+        if (slash != string::npos) base = base.substr(slash + 1);
+        o << "<br>" << base << " " << human_bytes(sf.bytes);
     }
     o << " |\n";
     o << "| Error-level events | " << s.level_count["E"] - s.auth_events << " (" << s.auth_events << " routine auth) |\n\n";
