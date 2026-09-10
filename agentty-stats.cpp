@@ -356,6 +356,12 @@ static bool process_file(Stats& s, const char* path) {
     FILE* f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "error: cannot open %s\n", path); return false; }
     s.cur_file = path;
+    // File boundary: nothing from a previous file may bleed into this one.
+    s.have_cur = false;
+    s.cur_turn = nullptr;
+    s.pend_role.clear(); s.pend_complexity.clear(); s.pend_model.clear();
+    s.pend_effort.clear(); s.pend_provider.clear();
+    s.pend_orch = s.pend_sub = s.pend_comp = 0;
 
     static const std::regex LINE_RE(
         R"(^(\S+)\s+\+(\d+)ms\s+(\S+)\s+([TDIWE])\s+(\w+)\s+([\w.]+):\s?(.*)$)");
@@ -963,12 +969,10 @@ int main(int argc, char** argv) {
                                  return a->second.total_usd > b->second.total_usd;
                              return a->first < b->first;
                          });
-        double grand_in = 0, grand_out = 0, grand_total = 0;
+        double grand_total = 0;
         for (const auto* kv : cost_rows) {
             const string& name = kv->first;
             const CostAcc& a = kv->second;
-            grand_in += a.input_usd;
-            grand_out += a.output_usd;
             grand_total += a.total_usd;
             o << "| " << name
               << " | " << usd_fmt(a.rate_in)
@@ -980,7 +984,7 @@ int main(int argc, char** argv) {
               << (a.exact_rate ? "" : " (approx.)")
               << " |\n";
         }
-        o << "| **Total** | | " << usd_fmt(grand_in) << " | | " << usd_fmt(grand_out) << " | | **" << usd_fmt(grand_total) << "** |\n\n";
+        o << "| | | | | | | **" << usd_fmt(grand_total) << "** |\n\n";
         long long unpriced_turns = 0;
         for (auto& kv : s.models) {
             if (cost_acc.count(kv.first)) continue;
